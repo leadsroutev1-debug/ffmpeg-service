@@ -26,49 +26,66 @@ app.use((req, res, next) => {
   next();
 });
 
-// ❤️ Health check
+// ❤️ Health
 app.get("/", (req, res) => {
-  res.send("FFmpeg + Cloudinary service running 🚀");
+  res.send("Smart FFmpeg + Cloudinary service 🚀");
 });
+
+// 🧠 Extract number from filename/url
+const extractSceneNumber = (str) => {
+  const match = str.match(/(\d+)/g);
+  if (!match) return Number.MAX_SAFE_INTEGER;
+  return parseInt(match[match.length - 1], 10);
+};
 
 // 🎬 MAIN MERGE ENDPOINT
 app.post("/merge", async (req, res) => {
   try {
-    const { clips } = req.body;
+    let { clips } = req.body;
 
     if (!clips || clips.length < 2) {
       return res.status(400).json({ error: "Need at least 2 clips" });
     }
 
-    const jobId = uuidv4();
-    const tempDir = `/tmp/${jobId}`;
-    fs.mkdirSync(tempDir);
-
-    // ⬇️ 1. Download clips
-    const localClips = [];
-
-    for (let i = 0; i < clips.length; i++) {
-      const url = clips[i];
-      const filePath = `${tempDir}/clip_${i}.mp4`;
-
-      const response = await axios({
-        method: "GET",
-        url,
-        responseType: "stream",
-      });
-
-      const writer = fs.createWriteStream(filePath);
-      response.data.pipe(writer);
-
-      await new Promise((resolve, reject) => {
-        writer.on("finish", resolve);
-        writer.on("error", reject);
-      });
-
-      localClips.push(filePath);
+    if (clips.length > 50) {
+      return res.status(400).json({ error: "Too many clips" });
     }
 
-    // 🧾 2. Create concat file
+    // 🧠 SORT CLIPS NUMERICALLY
+    clips = clips.sort((a, b) => {
+      return extractSceneNumber(a) - extractSceneNumber(b);
+    });
+
+    console.log("Sorted clips:", clips);
+
+    const jobId = uuidv4();
+    const tempDir = `/tmp/${jobId}`;
+    fs.mkdirSync(tempDir, { recursive: true });
+
+    // ⚡ Parallel download
+    const localClips = await Promise.all(
+      clips.map(async (url, i) => {
+        const filePath = `${tempDir}/clip_${i}.mp4`;
+
+        const response = await axios({
+          method: "GET",
+          url,
+          responseType: "stream",
+        });
+
+        const writer = fs.createWriteStream(filePath);
+        response.data.pipe(writer);
+
+        await new Promise((resolve, reject) => {
+          writer.on("finish", resolve);
+          writer.on("error", reject);
+        });
+
+        return filePath;
+      })
+    );
+
+    // 🧾 Create concat file
     const concatPath = `${tempDir}/concat.txt`;
     const concatContent = localClips
       .map((c) => `file '${c}'`)
@@ -76,12 +93,12 @@ app.post("/merge", async (req, res) => {
 
     fs.writeFileSync(concatPath, concatContent);
 
-    // 🎥 3. Merge + compress
+    // 🎥 Merge
     const outputPath = `${tempDir}/output.mp4`;
 
     await new Promise((resolve, reject) => {
       exec(
-        `ffmpeg -y -f concat -safe 0 -i ${concatPath} -vcodec libx264 -crf 28 -preset fast -acodec aac ${outputPath}`,
+        `ffmpeg -y -f concat -safe 0 -i "${concatPath}" -vcodec libx264 -crf 23 -preset medium -acodec aac "${outputPath}"`,
         (err) => {
           if (err) return reject(err);
           resolve();
@@ -89,20 +106,20 @@ app.post("/merge", async (req, res) => {
       );
     });
 
-    // ☁️ 4. Upload to Cloudinary
+    // ☁️ Upload
     const uploadResult = await cloudinary.uploader.upload(outputPath, {
       resource_type: "video",
       folder: "ai-movies",
     });
 
-    // 🧹 5. Cleanup
+    // 🧹 Cleanup
     fs.rmSync(tempDir, { recursive: true, force: true });
 
-    // ✅ 6. Return URL
     res.json({
       success: true,
       url: uploadResult.secure_url,
       duration: uploadResult.duration,
+      clipsProcessed: clips.length,
     });
 
   } catch (err) {
@@ -111,6 +128,15 @@ app.post("/merge", async (req, res) => {
       error: "Processing failed",
       details: err.message,
     });
+  }
+});
+
+// ✅ FFmpeg check
+exec("ffmpeg -version", (err) => {
+  if (err) {
+    console.error("❌ FFmpeg not installed");
+  } else {
+    console.log("✅ FFmpeg ready");
   }
 });
 
