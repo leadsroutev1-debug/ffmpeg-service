@@ -1,12 +1,13 @@
 import express from "express";
 import axios from "axios";
 import fs from "fs";
-import { exec } from "child_process";
+import path from "path";
+import { spawn } from "child_process";
 import { v4 as uuidv4 } from "uuid";
 import { v2 as cloudinary } from "cloudinary";
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY;
@@ -18,28 +19,53 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// 🔐 Auth middleware
+// ⏱ Prevent Render timeout killing early
 app.use((req, res, next) => {
-  if (req.headers["x-api-key"] !== API_KEY) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
+  res.setTimeout(120000); // 2 minutes
   next();
 });
 
-// ❤️ Health
+// 🔐 Scoped auth middleware
+const auth = (req, res, next) => {
+  if (!API_KEY || req.headers["x-api-key"] !== API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+};
+
+// ❤️ Health route (NO AUTH)
 app.get("/", (req, res) => {
   res.send("Smart FFmpeg + Cloudinary service 🚀");
 });
 
-// 🧠 Extract number from filename/url
+// 🧠 Extract number for sorting
 const extractSceneNumber = (str) => {
   const match = str.match(/(\d+)/g);
   if (!match) return Number.MAX_SAFE_INTEGER;
   return parseInt(match[match.length - 1], 10);
 };
 
-// 🎬 MAIN MERGE ENDPOINT
-app.post("/merge", async (req, res) => {
+// 📥 Download helper (safer)
+const downloadFile = async (url, outputPath) => {
+  const response = await axios({
+    method: "GET",
+    url,
+    responseType: "stream",
+    timeout: 30000,
+  });
+
+  await new Promise((resolve, reject) => {
+    const writer = fs.createWriteStream(outputPath);
+    response.data.pipe(writer);
+    writer.on("finish", resolve);
+    writer.on("error", reject);
+  });
+};
+
+// 🎬 MERGE ENDPOINT
+app.post("/merge", auth, async (req, res) => {
+  let tempDir;
+
   try {
     let { clips } = req.body;
 
@@ -51,62 +77,71 @@ app.post("/merge", async (req, res) => {
       return res.status(400).json({ error: "Too many clips" });
     }
 
-    // 🧠 SORT CLIPS NUMERICALLY
-    clips = clips.sort((a, b) => {
-      return extractSceneNumber(a) - extractSceneNumber(b);
-    });
+    // 🧠 Sort clips
+    clips = clips.sort(
+      (a, b) => extractSceneNumber(a) - extractSceneNumber(b)
+    );
 
     console.log("Sorted clips:", clips);
 
     const jobId = uuidv4();
-    const tempDir = `/tmp/${jobId}`;
+    tempDir = `/tmp/${jobId}`;
     fs.mkdirSync(tempDir, { recursive: true });
 
-    // ⚡ Parallel download
+    // ⚡ Download clips
     const localClips = await Promise.all(
       clips.map(async (url, i) => {
-        const filePath = `${tempDir}/clip_${i}.mp4`;
-
-        const response = await axios({
-          method: "GET",
-          url,
-          responseType: "stream",
-        });
-
-        const writer = fs.createWriteStream(filePath);
-        response.data.pipe(writer);
-
-        await new Promise((resolve, reject) => {
-          writer.on("finish", resolve);
-          writer.on("error", reject);
-        });
-
+        const filePath = path.join(tempDir, `clip_${i}.mp4`);
+        await downloadFile(url, filePath);
         return filePath;
       })
     );
 
     // 🧾 Create concat file
-    const concatPath = `${tempDir}/concat.txt`;
-    const concatContent = localClips
-      .map((c) => `file '${c}'`)
-      .join("\n");
+    const concatPath = path.join(tempDir, "concat.txt");
+    fs.writeFileSync(
+      concatPath,
+      localClips.map((c) => `file '${c}'`).join("\n")
+    );
 
-    fs.writeFileSync(concatPath, concatContent);
+    const outputPath = path.join(tempDir, "output.mp4");
 
-    // 🎥 Merge
-    const outputPath = `${tempDir}/output.mp4`;
-
+    // 🎥 FFmpeg merge (ROBUST)
     await new Promise((resolve, reject) => {
-      exec(
-        `ffmpeg -y -f concat -safe 0 -i "${concatPath}" -vcodec libx264 -crf 23 -preset medium -acodec aac "${outputPath}"`,
-        (err) => {
-          if (err) return reject(err);
-          resolve();
+      const ffmpeg = spawn("ffmpeg", [
+        "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concatPath,
+
+        // 🔥 Normalize everything (THIS FIXES MOST FAILURES)
+        "-vf",
+        "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2",
+        "-r", "30",
+
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "23",
+
+        "-c:a", "aac",
+        "-b:a", "128k",
+
+        outputPath
+      ]);
+
+      ffmpeg.stderr.on("data", (data) => {
+        console.log("FFmpeg:", data.toString());
+      });
+
+      ffmpeg.on("close", (code) => {
+        if (code !== 0) {
+          return reject(new Error(`FFmpeg failed with code ${code}`));
         }
-      );
+        resolve();
+      });
     });
 
-    // ☁️ Upload
+    // ☁️ Upload to Cloudinary
     const uploadResult = await cloudinary.uploader.upload(outputPath, {
       resource_type: "video",
       folder: "ai-movies",
@@ -123,7 +158,12 @@ app.post("/merge", async (req, res) => {
     });
 
   } catch (err) {
-    console.error(err);
+    console.error("❌ ERROR:", err);
+
+    if (tempDir) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+
     res.status(500).json({
       error: "Processing failed",
       details: err.message,
@@ -131,15 +171,14 @@ app.post("/merge", async (req, res) => {
   }
 });
 
-// ✅ FFmpeg check
-exec("ffmpeg -version", (err) => {
-  if (err) {
-    console.error("❌ FFmpeg not installed");
-  } else {
-    console.log("✅ FFmpeg ready");
-  }
+// ✅ FFmpeg check (startup)
+const ffmpegCheck = spawn("ffmpeg", ["-version"]);
+ffmpegCheck.on("close", (code) => {
+  if (code === 0) console.log("✅ FFmpeg ready");
+  else console.error("❌ FFmpeg missing");
 });
 
+// 🚀 Start server
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
