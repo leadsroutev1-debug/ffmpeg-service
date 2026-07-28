@@ -12,7 +12,7 @@ import pLimit from "p-limit";
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY;
 
-const MAX_CLIPS = 20;
+const MAX_CLIPS = 50;
 const MAX_CONCURRENT_JOBS = 2;
 const DOWNLOAD_CONCURRENCY = 3;
 const FFMPEG_TIMEOUT = 240000;
