@@ -19,13 +19,13 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// ⏱ Prevent Render timeout killing early
+// ⏱ Increase timeout (important for Render)
 app.use((req, res, next) => {
-  res.setTimeout(120000); // 2 minutes
+  res.setTimeout(300000); // 5 minutes
   next();
 });
 
-// 🔐 Scoped auth middleware
+// 🔐 Auth middleware
 const auth = (req, res, next) => {
   if (!API_KEY || req.headers["x-api-key"] !== API_KEY) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -33,25 +33,28 @@ const auth = (req, res, next) => {
   next();
 };
 
-// ❤️ Health route (NO AUTH)
+// ❤️ Health check
 app.get("/", (req, res) => {
-  res.send("Smart FFmpeg + Cloudinary service 🚀");
+  res.send("FFmpeg + Cloudinary service running 🚀");
 });
 
-// 🧠 Extract number for sorting
+// 🧠 Smart scene sorter
 const extractSceneNumber = (str) => {
   const match = str.match(/(\d+)/g);
   if (!match) return Number.MAX_SAFE_INTEGER;
   return parseInt(match[match.length - 1], 10);
 };
 
-// 📥 Download helper (safer)
+// 📥 Safer download
 const downloadFile = async (url, outputPath) => {
+  console.log("⬇️ Downloading:", url);
+
   const response = await axios({
     method: "GET",
     url,
     responseType: "stream",
     timeout: 30000,
+    maxContentLength: 100 * 1024 * 1024,
   });
 
   await new Promise((resolve, reject) => {
@@ -73,7 +76,7 @@ app.post("/merge", auth, async (req, res) => {
       return res.status(400).json({ error: "Need at least 2 clips" });
     }
 
-    if (clips.length > 50) {
+    if (clips.length > 20) {
       return res.status(400).json({ error: "Too many clips" });
     }
 
@@ -82,13 +85,13 @@ app.post("/merge", auth, async (req, res) => {
       (a, b) => extractSceneNumber(a) - extractSceneNumber(b)
     );
 
-    console.log("Sorted clips:", clips);
+    console.log("🎞 Sorted clips:", clips);
 
     const jobId = uuidv4();
-    tempDir = `/tmp/${jobId}`;
+    tempDir = path.join(process.cwd(), "tmp", jobId);
     fs.mkdirSync(tempDir, { recursive: true });
 
-    // ⚡ Download clips
+    // 📥 Download clips
     const localClips = await Promise.all(
       clips.map(async (url, i) => {
         const filePath = path.join(tempDir, `clip_${i}.mp4`);
@@ -97,37 +100,35 @@ app.post("/merge", auth, async (req, res) => {
       })
     );
 
-    // 🧾 Create concat file
-    const concatPath = path.join(tempDir, "concat.txt");
-    fs.writeFileSync(
-      concatPath,
-      localClips.map((c) => `file '${c}'`).join("\n")
-    );
-
     const outputPath = path.join(tempDir, "output.mp4");
 
-    // 🎥 FFmpeg merge (ROBUST)
+    // 🎥 FFmpeg (FAST + STABLE)
     await new Promise((resolve, reject) => {
-      const ffmpeg = spawn("ffmpeg", [
+      const ffmpegArgs = [
         "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", concatPath,
 
-        // 🔥 Normalize everything (THIS FIXES MOST FAILURES)
-        "-vf",
-        "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2",
-        "-r", "30",
+        // input files
+        ...localClips.flatMap((clip) => ["-i", clip]),
+
+        // concat filter (handles mismatches)
+        "-filter_complex",
+        `${localClips.map((_, i) => `[${i}:v]`).join("")}concat=n=${localClips.length}:v=1:a=0[outv]`,
+
+        "-map", "[outv]",
+
+        // 🔥 PERFORMANCE SETTINGS (critical)
+        "-vf", "scale=480:-2",
+        "-preset", "ultrafast",
+        "-crf", "28",
+        "-r", "24",
 
         "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
 
-        "-c:a", "aac",
-        "-b:a", "128k",
+        outputPath,
+      ];
 
-        outputPath
-      ]);
+      console.log("🚀 Running FFmpeg...");
+      const ffmpeg = spawn("ffmpeg", ffmpegArgs);
 
       ffmpeg.stderr.on("data", (data) => {
         console.log("FFmpeg:", data.toString());
@@ -141,7 +142,8 @@ app.post("/merge", auth, async (req, res) => {
       });
     });
 
-    // ☁️ Upload to Cloudinary
+    console.log("☁️ Uploading to Cloudinary...");
+
     const uploadResult = await cloudinary.uploader.upload(outputPath, {
       resource_type: "video",
       folder: "ai-movies",
@@ -171,7 +173,7 @@ app.post("/merge", auth, async (req, res) => {
   }
 });
 
-// ✅ FFmpeg check (startup)
+// ✅ FFmpeg check
 const ffmpegCheck = spawn("ffmpeg", ["-version"]);
 ffmpegCheck.on("close", (code) => {
   if (code === 0) console.log("✅ FFmpeg ready");
