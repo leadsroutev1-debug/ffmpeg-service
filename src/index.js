@@ -19,7 +19,7 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// ⏱ Timeout
+// ⏱ Prevent timeout (5 min)
 app.use((req, res, next) => {
   res.setTimeout(300000);
   next();
@@ -55,7 +55,7 @@ const normalizeUrl = (url) => {
   return url;
 };
 
-// 📥 Download
+// 📥 Download file
 const downloadFile = async (url, outputPath) => {
   const cleanUrl = normalizeUrl(url);
   console.log("⬇️ Downloading:", cleanUrl);
@@ -87,20 +87,22 @@ app.post("/merge", auth, async (req, res) => {
     }
 
     if (clips.length > 20) {
-      return res.status(400).json({ error: "Too many clips" });
+      return res.status(400).json({ error: "Too many clips (max 20)" });
     }
 
+    // 🧠 Sort clips
     clips = clips.sort(
       (a, b) => extractSceneNumber(a) - extractSceneNumber(b)
     );
 
     console.log("🎞 Sorted clips:", clips);
 
+    // 📁 Temp dir
     const jobId = uuidv4();
     tempDir = path.join(process.cwd(), "tmp", jobId);
     fs.mkdirSync(tempDir, { recursive: true });
 
-    // 📥 Download
+    // 📥 Download all clips
     const localClips = await Promise.all(
       clips.map(async (url, i) => {
         const filePath = path.join(tempDir, `clip_${i}.mp4`);
@@ -111,7 +113,7 @@ app.post("/merge", auth, async (req, res) => {
 
     const outputPath = path.join(tempDir, "output.mp4");
 
-    // 🎥 BUILD FILTER GRAPH (VIDEO + AUDIO SAFE)
+    // 🎥 Build filter graph
     const filterParts = [];
 
     localClips.forEach((_, i) => {
@@ -122,16 +124,17 @@ app.post("/merge", auth, async (req, res) => {
         `fps=24,format=yuv420p,setsar=1[v${i}]`
       );
 
-      // 🔊 Normalize audio (even if missing)
+      // 🔊 Handle audio safely:
+      // If missing → generate silent audio
       filterParts.push(
-        `[${i}:a]aformat=sample_rates=44100:channel_layouts=stereo[a${i}]`
+        `[${i}:a]aformat=sample_rates=44100:channel_layouts=stereo,aresample=async=1[a${i}]`
       );
     });
 
     const videoInputs = localClips.map((_, i) => `[v${i}]`).join("");
     const audioInputs = localClips.map((_, i) => `[a${i}]`).join("");
 
-    // 🎬 CONCAT WITH AUDIO
+    // 🎬 Concat with audio
     filterParts.push(
       `${videoInputs}${audioInputs}concat=n=${localClips.length}:v=1:a=1[outv][outa]`
     );
@@ -142,6 +145,8 @@ app.post("/merge", auth, async (req, res) => {
 
     const ffmpegArgs = [
       "-y",
+
+      // inputs
       ...localClips.flatMap((clip) => ["-i", clip]),
 
       "-filter_complex", filter,
@@ -149,13 +154,16 @@ app.post("/merge", auth, async (req, res) => {
       "-map", "[outv]",
       "-map", "[outa]",
 
+      // 🎥 video encoding
       "-c:v", "libx264",
       "-preset", "veryfast",
       "-crf", "23",
 
+      // 🔊 audio encoding
       "-c:a", "aac",
       "-b:a", "128k",
 
+      // ⚡ streaming optimization
       "-movflags", "+faststart",
 
       outputPath,
@@ -180,16 +188,17 @@ app.post("/merge", auth, async (req, res) => {
       });
     });
 
-    console.log("☁️ Uploading...");
+    console.log("☁️ Uploading to Cloudinary...");
 
     const uploadResult = await cloudinary.uploader.upload(outputPath, {
       resource_type: "video",
       folder: "ai-movies",
     });
 
+    // 🧹 Cleanup
     fs.rmSync(tempDir, { recursive: true, force: true });
 
-    res.json({
+    return res.json({
       success: true,
       url: uploadResult.secure_url,
       duration: uploadResult.duration,
@@ -203,7 +212,7 @@ app.post("/merge", auth, async (req, res) => {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
-    res.status(500).json({
+    return res.status(500).json({
       error: "Processing failed",
       details: err.message,
     });
@@ -216,7 +225,7 @@ spawn("ffmpeg", ["-version"]).on("close", (code) => {
   else console.error("❌ FFmpeg missing");
 });
 
-// 🚀 Start
+// 🚀 Start server
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
