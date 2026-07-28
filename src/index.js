@@ -179,13 +179,24 @@ const normalizeClip = async (input, output, jobId, webhook) => {
   await runFFmpeg([
     "-y",
     "-i", input,
-    "-vf", `scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT},fps=30`,
+
+    // ✅ ADD SILENT AUDIO TRACK (CRITICAL FIX)
+    "-f", "lavfi",
+    "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+
+    "-shortest",
+
+    // ✅ SAFE SCALING (FIXES DIMENSION MISMATCH)
+    "-vf", `scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps=30`,
+
     "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
     "-preset", "veryfast",
     "-crf", "23",
+
     "-c:a", "aac",
     "-ar", "44100",
     "-ac", "2",
+
     "-movflags", "+faststart",
     output
   ], jobId, webhook);
@@ -292,7 +303,7 @@ app.post("/merge", auth, async (req, res) => {
         size: fs.statSync(outputPath).size
       });
 
-      // ✅ FIXED: STREAM UPLOAD (prevents failures on Render)
+      // ================= CLOUDINARY STREAM UPLOAD =================
       const upload = await new Promise((resolve, reject) => {
         const stream = cloudinary.uploader.upload_stream(
           {
