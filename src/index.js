@@ -17,11 +17,9 @@ const MAX_CONCURRENT_JOBS = 2;
 const DOWNLOAD_CONCURRENCY = 3;
 const FFMPEG_TIMEOUT = 240000;
 
-const MAX_FILE_SIZE_MB = 100;
 const OUTPUT_WIDTH = 480;
 const OUTPUT_HEIGHT = 854;
 
-// 🔥 GPU toggle
 const USE_GPU = process.env.USE_GPU === "true";
 
 if (!API_KEY) {
@@ -40,7 +38,7 @@ cloudinary.config({
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-// ================= JOB STORE (🔥 SWAP WITH REDIS LATER) =================
+// ================= JOB STORE =================
 const jobs = new Map();
 
 // ================= RATE LIMIT =================
@@ -79,11 +77,23 @@ const log = (msg, data = {}) => {
   }));
 };
 
+// ================= WEBHOOK SAFE SENDER =================
+const sendWebhook = async (url, payload) => {
+  if (!url) return;
+  try {
+    await axios.post(url, payload, { timeout: 10000 });
+  } catch (err) {
+    log("webhook_failed", { error: err.message });
+  }
+};
+
 // ================= HELPERS =================
 const updateJob = (id, patch) => {
   const job = jobs.get(id);
   if (!job) return;
-  jobs.set(id, { ...job, ...patch });
+  const updated = { ...job, ...patch };
+  jobs.set(id, updated);
+  return updated;
 };
 
 const extractSceneNumber = (str) => {
@@ -121,7 +131,7 @@ const downloadFile = async (url, outputPath) => {
 };
 
 // ================= FFMPEG =================
-const runFFmpeg = (args, jobId) => {
+const runFFmpeg = (args, jobId, webhook) => {
   return new Promise((resolve, reject) => {
     const ffmpeg = spawn("ffmpeg", args);
 
@@ -130,14 +140,22 @@ const runFFmpeg = (args, jobId) => {
       reject(new Error("FFmpeg timeout"));
     }, FFMPEG_TIMEOUT);
 
-    ffmpeg.stderr.on("data", d => {
+    ffmpeg.stderr.on("data", async (d) => {
       const output = d.toString();
       log("ffmpeg", { output });
 
-      // 🔥 basic progress extraction
       const timeMatch = output.match(/time=(\d+:\d+:\d+\.\d+)/);
       if (timeMatch) {
-        updateJob(jobId, { progress: timeMatch[1] });
+        const progress = timeMatch[1];
+
+        updateJob(jobId, { progress });
+
+        // 🔥 LIVE PROGRESS → n8n
+        await sendWebhook(webhook, {
+          jobId,
+          status: "processing",
+          progress
+        });
       }
     });
 
@@ -149,18 +167,16 @@ const runFFmpeg = (args, jobId) => {
   });
 };
 
-// ================= HEALTH =================
+// ================= ROUTES =================
 app.get("/", (_, res) => res.send("FFmpeg service running 🚀"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// ================= STATUS =================
 app.get("/status/:id", auth, (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: "Not found" });
   res.json(job);
 });
 
-// ================= DASHBOARD =================
 app.get("/jobs", auth, (_, res) => {
   res.json([...jobs.values()]);
 });
@@ -178,10 +194,16 @@ app.post("/merge", auth, async (req, res) => {
   jobLimit(async () => {
     let tempDir;
 
-    try {
-      updateJob(requestId, { status: "processing" });
+    let { clips, webhook, transition = "none" } = req.body;
 
-      let { clips, webhook, transition = "none" } = req.body;
+    try {
+      // 🔥 START EVENT
+      await sendWebhook(webhook, {
+        jobId: requestId,
+        status: "started"
+      });
+
+      updateJob(requestId, { status: "processing" });
 
       if (!clips || clips.length < 2) throw new Error("Need at least 2 clips");
 
@@ -210,8 +232,7 @@ app.post("/merge", auth, async (req, res) => {
       // ================= FILTER =================
       let filter = "";
 
-      if (transition === "fade") {
-        // 🔥 crossfade example
+      if (transition === "fade" && localClips.length >= 2) {
         filter = `
         [0:v][1:v]xfade=transition=fade:duration=1:offset=4[v];
         [0:a][1:a]acrossfade=d=1[a]
@@ -237,7 +258,7 @@ app.post("/merge", auth, async (req, res) => {
         "-c:a", "aac",
         "-movflags", "+faststart",
         outputPath
-      ], requestId);
+      ], requestId, webhook);
 
       updateJob(requestId, { step: "uploading" });
 
@@ -249,6 +270,7 @@ app.post("/merge", auth, async (req, res) => {
       fs.rmSync(tempDir, { recursive: true, force: true });
 
       const result = {
+        jobId: requestId,
         status: "done",
         url: upload.secure_url,
         duration: upload.duration
@@ -256,16 +278,25 @@ app.post("/merge", auth, async (req, res) => {
 
       jobs.set(requestId, { ...jobs.get(requestId), ...result });
 
-      if (webhook) {
-        axios.post(webhook, result).catch(() => {});
-      }
+      // 🔥 SUCCESS EVENT
+      await sendWebhook(webhook, result);
 
     } catch (err) {
-      jobs.set(requestId, {
-        ...jobs.get(requestId),
+      const failPayload = {
+        jobId: requestId,
         status: "failed",
         error: err.message
+      };
+
+      jobs.set(requestId, {
+        ...jobs.get(requestId),
+        ...failPayload
       });
+
+      // 🔥 FAILURE EVENT
+      await sendWebhook(webhook, failPayload);
+
+      if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
 
