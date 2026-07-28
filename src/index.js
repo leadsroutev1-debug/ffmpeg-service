@@ -229,7 +229,6 @@ app.post("/merge", auth, async (req, res) => {
       updateJob(requestId, { status: "processing" });
 
       if (!clips || clips.length < 2) throw new Error("Need at least 2 clips");
-
       if (clips.length > MAX_CLIPS) throw new Error("Too many clips");
 
       clips = clips.sort(
@@ -267,7 +266,7 @@ app.post("/merge", auth, async (req, res) => {
 
       // ================= CONCAT =================
       const filter =
-        normalized.map((_, i) => `[${i}:v][${i}:a]`).join("") +
+        normalized.map((_, i) => `[${i}:v:0][${i}:a:0]`).join("") +
         `concat=n=${normalized.length}:v=1:a=1[outv][outa]`;
 
       const outputPath = path.join(tempDir, "output.mp4");
@@ -288,9 +287,25 @@ app.post("/merge", auth, async (req, res) => {
 
       updateJob(requestId, { step: "uploading" });
 
-      const upload = await cloudinary.uploader.upload(outputPath, {
-        resource_type: "video",
-        folder: "ai-movies",
+      log("upload_start", {
+        path: outputPath,
+        size: fs.statSync(outputPath).size
+      });
+
+      // ✅ FIXED: STREAM UPLOAD (prevents failures on Render)
+      const upload = await new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          {
+            resource_type: "video",
+            folder: "ai-movies",
+          },
+          (err, result) => {
+            if (err) return reject(err);
+            resolve(result);
+          }
+        );
+
+        fs.createReadStream(outputPath).pipe(stream);
       });
 
       fs.rmSync(tempDir, { recursive: true, force: true });
@@ -310,7 +325,7 @@ app.post("/merge", auth, async (req, res) => {
       const failPayload = {
         jobId: requestId,
         status: "failed",
-        error: err.message
+        error: err?.response?.data || err.message
       };
 
       jobs.set(requestId, {
