@@ -13,9 +13,16 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY;
 
 const MAX_CLIPS = 20;
-const MAX_CONCURRENT_JOBS = 2;     // 🔥 tune for your CPU
-const DOWNLOAD_CONCURRENCY = 3;    // 🔥 tune for bandwidth
-const FFMPEG_TIMEOUT = 240000;     // 4 min safety kill
+const MAX_CONCURRENT_JOBS = 2;
+const DOWNLOAD_CONCURRENCY = 3;
+const FFMPEG_TIMEOUT = 240000;
+
+const MAX_FILE_SIZE_MB = 100;
+const OUTPUT_WIDTH = 480;
+const OUTPUT_HEIGHT = 854;
+
+// 🔥 GPU toggle
+const USE_GPU = process.env.USE_GPU === "true";
 
 if (!API_KEY) {
   console.error("❌ Missing API_KEY");
@@ -33,14 +40,24 @@ cloudinary.config({
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-// prevent timeout
+// ================= JOB STORE (🔥 SWAP WITH REDIS LATER) =================
+const jobs = new Map();
+
+// ================= RATE LIMIT =================
+const requestCounts = new Map();
+setInterval(() => requestCounts.clear(), 60000);
+
 app.use((req, res, next) => {
-  res.setTimeout(300000);
+  const ip = req.ip;
+  const count = requestCounts.get(ip) || 0;
+
+  if (count > 30) {
+    return res.status(429).json({ error: "Rate limit exceeded" });
+  }
+
+  requestCounts.set(ip, count + 1);
   next();
 });
-
-// ================= SIMPLE JOB QUEUE =================
-const jobLimit = pLimit(MAX_CONCURRENT_JOBS);
 
 // ================= AUTH =================
 const auth = (req, res, next) => {
@@ -50,14 +67,23 @@ const auth = (req, res, next) => {
   next();
 };
 
-// ================= HEALTH =================
-app.get("/", (_, res) => res.send("FFmpeg service running 🚀"));
-app.get("/health", (_, res) => res.json({ ok: true }));
-app.get("/ready", (_, res) => res.json({ ready: true }));
+// ================= QUEUE =================
+const jobLimit = pLimit(MAX_CONCURRENT_JOBS);
+
+// ================= LOGGER =================
+const log = (msg, data = {}) => {
+  console.log(JSON.stringify({
+    msg,
+    ...data,
+    time: new Date().toISOString()
+  }));
+};
 
 // ================= HELPERS =================
-const log = (msg, data = {}) => {
-  console.log(JSON.stringify({ msg, ...data, time: new Date().toISOString() }));
+const updateJob = (id, patch) => {
+  const job = jobs.get(id);
+  if (!job) return;
+  jobs.set(id, { ...job, ...patch });
 };
 
 const extractSceneNumber = (str) => {
@@ -75,38 +101,27 @@ const normalizeUrl = (url) => {
   return url;
 };
 
-// ================= DOWNLOAD (RETRY + STREAM) =================
-const downloadFile = async (url, outputPath, retries = 3) => {
+// ================= DOWNLOAD =================
+const downloadFile = async (url, outputPath) => {
   const cleanUrl = normalizeUrl(url);
 
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      log("⬇️ Downloading", { url: cleanUrl, attempt });
+  const res = await axios({
+    method: "GET",
+    url: cleanUrl,
+    responseType: "stream",
+    timeout: 60000,
+  });
 
-      const response = await axios({
-        method: "GET",
-        url: cleanUrl,
-        responseType: "stream",
-        timeout: 60000,
-      });
-
-      await new Promise((resolve, reject) => {
-        const writer = fs.createWriteStream(outputPath);
-        response.data.pipe(writer);
-        writer.on("finish", resolve);
-        writer.on("error", reject);
-      });
-
-      return;
-    } catch (err) {
-      if (attempt === retries) throw err;
-      await new Promise((r) => setTimeout(r, 1000 * attempt));
-    }
-  }
+  await new Promise((resolve, reject) => {
+    const writer = fs.createWriteStream(outputPath);
+    res.data.pipe(writer);
+    writer.on("finish", resolve);
+    writer.on("error", reject);
+  });
 };
 
-// ================= FFMPEG RUN =================
-const runFFmpeg = (args) => {
+// ================= FFMPEG =================
+const runFFmpeg = (args, jobId) => {
   return new Promise((resolve, reject) => {
     const ffmpeg = spawn("ffmpeg", args);
 
@@ -115,143 +130,149 @@ const runFFmpeg = (args) => {
       reject(new Error("FFmpeg timeout"));
     }, FFMPEG_TIMEOUT);
 
-    ffmpeg.stderr.on("data", (data) => {
-      log("ffmpeg", { output: data.toString() });
+    ffmpeg.stderr.on("data", d => {
+      const output = d.toString();
+      log("ffmpeg", { output });
+
+      // 🔥 basic progress extraction
+      const timeMatch = output.match(/time=(\d+:\d+:\d+\.\d+)/);
+      if (timeMatch) {
+        updateJob(jobId, { progress: timeMatch[1] });
+      }
     });
 
-    ffmpeg.on("error", reject);
-
-    ffmpeg.on("close", (code) => {
+    ffmpeg.on("close", code => {
       clearTimeout(timeout);
-      if (code !== 0) return reject(new Error(`FFmpeg exited ${code}`));
+      if (code !== 0) return reject(new Error(`FFmpeg exit ${code}`));
       resolve();
     });
   });
 };
 
+// ================= HEALTH =================
+app.get("/", (_, res) => res.send("FFmpeg service running 🚀"));
+app.get("/health", (_, res) => res.json({ ok: true }));
+
+// ================= STATUS =================
+app.get("/status/:id", auth, (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: "Not found" });
+  res.json(job);
+});
+
+// ================= DASHBOARD =================
+app.get("/jobs", auth, (_, res) => {
+  res.json([...jobs.values()]);
+});
+
 // ================= MERGE =================
 app.post("/merge", auth, async (req, res) => {
-  return jobLimit(async () => {
+  const requestId = uuidv4();
+
+  jobs.set(requestId, {
+    id: requestId,
+    status: "queued",
+    progress: 0
+  });
+
+  jobLimit(async () => {
     let tempDir;
 
     try {
-      let { clips } = req.body;
+      updateJob(requestId, { status: "processing" });
 
-      if (!clips || clips.length < 2) {
-        return res.status(400).json({ error: "Need at least 2 clips" });
-      }
+      let { clips, webhook, transition = "none" } = req.body;
 
-      if (clips.length > MAX_CLIPS) {
-        return res.status(400).json({ error: `Max ${MAX_CLIPS} clips` });
-      }
+      if (!clips || clips.length < 2) throw new Error("Need at least 2 clips");
 
       clips = clips.sort(
         (a, b) => extractSceneNumber(a) - extractSceneNumber(b)
       );
 
-      const jobId = uuidv4();
-      tempDir = path.join(os.tmpdir(), jobId);
+      tempDir = path.join(os.tmpdir(), requestId);
       fs.mkdirSync(tempDir, { recursive: true });
 
-      log("🎬 Job start", { jobId, clips: clips.length });
-
-      // 🔥 parallel download with limit
+      // ================= DOWNLOAD =================
       const limit = pLimit(DOWNLOAD_CONCURRENCY);
 
       const localClips = await Promise.all(
         clips.map((url, i) =>
           limit(async () => {
-            const filePath = path.join(tempDir, `clip_${i}.mp4`);
-            await downloadFile(url, filePath);
-            return filePath;
+            const file = path.join(tempDir, `clip_${i}.mp4`);
+            await downloadFile(url, file);
+            return file;
           })
         )
       );
 
-      const outputPath = path.join(tempDir, "output.mp4");
+      updateJob(requestId, { step: "encoding" });
 
       // ================= FILTER =================
-      const filterParts = [];
+      let filter = "";
 
-      localClips.forEach((_, i) => {
-        filterParts.push(
-          `[${i}:v]scale=480:854:force_original_aspect_ratio=decrease,` +
-          `pad=480:854:(ow-iw)/2:(oh-ih)/2,fps=24,format=yuv420p,setsar=1[v${i}]`
-        );
+      if (transition === "fade") {
+        // 🔥 crossfade example
+        filter = `
+        [0:v][1:v]xfade=transition=fade:duration=1:offset=4[v];
+        [0:a][1:a]acrossfade=d=1[a]
+        `;
+      } else {
+        const v = localClips.map((_, i) => `[${i}:v]`).join("");
+        const a = localClips.map((_, i) => `[${i}:a?]`).join("");
 
-        filterParts.push(
-          `[${i}:a]aformat=sample_rates=44100:channel_layouts=stereo,aresample=async=1[a${i}]`
-        );
-      });
+        filter = `${v}${a}concat=n=${localClips.length}:v=1:a=1[outv][outa]`;
+      }
 
-      const v = localClips.map((_, i) => `[v${i}]`).join("");
-      const a = localClips.map((_, i) => `[a${i}]`).join("");
+      const outputPath = path.join(tempDir, "output.mp4");
 
-      filterParts.push(
-        `${v}${a}concat=n=${localClips.length}:v=1:a=1[outv][outa]`
-      );
-
-      const ffmpegArgs = [
+      await runFFmpeg([
         "-y",
-        ...localClips.flatMap((c) => ["-i", c]),
-        "-filter_complex", filterParts.join(";"),
+        ...localClips.flatMap(c => ["-i", c]),
+        "-filter_complex", filter,
         "-map", "[outv]",
         "-map", "[outa]",
-        "-c:v", "libx264",
+        "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
         "-preset", "veryfast",
         "-crf", "23",
         "-c:a", "aac",
-        "-b:a", "128k",
         "-movflags", "+faststart",
-        outputPath,
-      ];
+        outputPath
+      ], requestId);
 
-      await runFFmpeg(ffmpegArgs);
-
-      log("☁️ Uploading", { jobId });
+      updateJob(requestId, { step: "uploading" });
 
       const upload = await cloudinary.uploader.upload(outputPath, {
         resource_type: "video",
         folder: "ai-movies",
-        chunk_size: 6000000, // 🔥 large uploads safer
       });
 
       fs.rmSync(tempDir, { recursive: true, force: true });
 
-      log("✅ Job complete", { jobId });
-
-      return res.json({
-        success: true,
+      const result = {
+        status: "done",
         url: upload.secure_url,
-        duration: upload.duration,
-        clipsProcessed: clips.length,
-      });
+        duration: upload.duration
+      };
 
-    } catch (err) {
-      log("❌ Job failed", { error: err.message });
+      jobs.set(requestId, { ...jobs.get(requestId), ...result });
 
-      if (tempDir) {
-        fs.rmSync(tempDir, { recursive: true, force: true });
+      if (webhook) {
+        axios.post(webhook, result).catch(() => {});
       }
 
-      return res.status(500).json({
-        error: "Processing failed",
-        details: err.message,
+    } catch (err) {
+      jobs.set(requestId, {
+        ...jobs.get(requestId),
+        status: "failed",
+        error: err.message
       });
     }
   });
-});
 
-// ================= FFMPEG CHECK =================
-spawn("ffmpeg", ["-version"]).on("close", (code) => {
-  if (code === 0) console.log("✅ FFmpeg ready");
-  else console.error("❌ FFmpeg missing");
-});
-
-// ================= GRACEFUL SHUTDOWN =================
-process.on("SIGTERM", () => {
-  console.log("🛑 Shutting down...");
-  process.exit(0);
+  res.json({
+    jobId: requestId,
+    statusUrl: `/status/${requestId}`
+  });
 });
 
 // ================= START =================
