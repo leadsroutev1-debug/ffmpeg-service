@@ -19,13 +19,13 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// ⏱ Prevent Render timeout killing response
+// ⏱ Prevent timeout
 app.use((req, res, next) => {
   res.setTimeout(300000);
   next();
 });
 
-// 🔐 Auth middleware
+// 🔐 Auth
 const auth = (req, res, next) => {
   if (!API_KEY || req.headers["x-api-key"] !== API_KEY) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -33,27 +33,38 @@ const auth = (req, res, next) => {
   next();
 };
 
-// ❤️ Health check
+// ❤️ Health
 app.get("/", (req, res) => {
   res.send("FFmpeg service running 🚀");
 });
 
-// 🧠 Extract scene number
+// 🧠 Scene sorting
 const extractSceneNumber = (str) => {
   const match = str.match(/(\d+)/g);
-  if (!match) return Number.MAX_SAFE_INTEGER;
-  return parseInt(match[match.length - 1], 10);
+  return match ? parseInt(match.pop(), 10) : Number.MAX_SAFE_INTEGER;
 };
 
-// 📥 Download file
+// ⚠️ FIX: convert Cloudinary player URLs → direct video URL
+const normalizeUrl = (url) => {
+  if (url.includes("player.cloudinary.com")) {
+    const match = url.match(/public_id=([^&]+)/);
+    if (!match) return url;
+
+    return `https://res.cloudinary.com/${process.env.CLOUDINARY_CLOUD_NAME}/video/upload/${match[1]}.mp4`;
+  }
+  return url;
+};
+
+// 📥 Download
 const downloadFile = async (url, outputPath) => {
-  console.log("⬇️ Downloading:", url);
+  const cleanUrl = normalizeUrl(url);
+  console.log("⬇️ Downloading:", cleanUrl);
 
   const response = await axios({
     method: "GET",
-    url,
+    url: cleanUrl,
     responseType: "stream",
-    timeout: 30000,
+    timeout: 60000,
   });
 
   await new Promise((resolve, reject) => {
@@ -64,7 +75,7 @@ const downloadFile = async (url, outputPath) => {
   });
 };
 
-// 🎬 MERGE ENDPOINT
+// 🎬 MERGE
 app.post("/merge", auth, async (req, res) => {
   let tempDir;
 
@@ -79,7 +90,6 @@ app.post("/merge", auth, async (req, res) => {
       return res.status(400).json({ error: "Too many clips" });
     }
 
-    // 🧠 Sort clips
     clips = clips.sort(
       (a, b) => extractSceneNumber(a) - extractSceneNumber(b)
     );
@@ -90,7 +100,7 @@ app.post("/merge", auth, async (req, res) => {
     tempDir = path.join(process.cwd(), "tmp", jobId);
     fs.mkdirSync(tempDir, { recursive: true });
 
-    // 📥 Download all clips
+    // 📥 Download
     const localClips = await Promise.all(
       clips.map(async (url, i) => {
         const filePath = path.join(tempDir, `clip_${i}.mp4`);
@@ -101,39 +111,46 @@ app.post("/merge", auth, async (req, res) => {
 
     const outputPath = path.join(tempDir, "output.mp4");
 
-    // 🎥 FIXED FFmpeg pipeline
+    // 🎥 FIXED FILTER BUILDER
+    const filterParts = [];
+
+    // Step 1: normalize each clip
+    localClips.forEach((_, i) => {
+      filterParts.push(`[${i}:v]scale=480:-2,setsar=1[v${i}]`);
+    });
+
+    // Step 2: concat inputs
+    const concatInputs = localClips.map((_, i) => `[v${i}]`).join("");
+    filterParts.push(`${concatInputs}concat=n=${localClips.length}:v=1:a=0[outv]`);
+
+    const filter = filterParts.join(";");
+
+    console.log("🧠 FILTER:", filter);
+
+    const ffmpegArgs = [
+      "-y",
+      ...localClips.flatMap((clip) => ["-i", clip]),
+      "-filter_complex", filter,
+      "-map", "[outv]",
+      "-c:v", "libx264",
+      "-preset", "ultrafast",
+      "-crf", "28",
+      "-r", "24",
+      "-pix_fmt", "yuv420p",
+      outputPath,
+    ];
+
+    console.log("🚀 FFmpeg args:", ffmpegArgs.join(" "));
+
     await new Promise((resolve, reject) => {
-      const filter = `
-${localClips
-  .map((_, i) => `[${i}:v]scale=480:-2[v${i}]`)
-  .join(";")}
-${localClips.map((_, i) => `[v${i}]`).join("")}
-concat=n=${localClips.length}:v=1:a=0[outv]
-`;
-
-      const ffmpegArgs = [
-        "-y",
-
-        // inputs
-        ...localClips.flatMap((clip) => ["-i", clip]),
-
-        "-filter_complex", filter,
-
-        "-map", "[outv]",
-
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "28",
-        "-r", "24",
-
-        outputPath,
-      ];
-
-      console.log("🚀 Running FFmpeg...");
       const ffmpeg = spawn("ffmpeg", ffmpegArgs);
 
       ffmpeg.stderr.on("data", (data) => {
         console.log(data.toString());
+      });
+
+      ffmpeg.on("error", (err) => {
+        reject(err);
       });
 
       ffmpeg.on("close", (code) => {
@@ -151,7 +168,6 @@ concat=n=${localClips.length}:v=1:a=0[outv]
       folder: "ai-movies",
     });
 
-    // 🧹 Cleanup
     fs.rmSync(tempDir, { recursive: true, force: true });
 
     res.json({
@@ -181,7 +197,7 @@ spawn("ffmpeg", ["-version"]).on("close", (code) => {
   else console.error("❌ FFmpeg missing");
 });
 
-// 🚀 Start server
+// 🚀 Start
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
