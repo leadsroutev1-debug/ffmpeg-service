@@ -12,14 +12,14 @@ app.use(express.json({ limit: "10mb" }));
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY;
 
-// 🔐 Cloudinary config
+// 🔐 Cloudinary
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// ⏱ Prevent timeout
+// ⏱ Timeout
 app.use((req, res, next) => {
   res.setTimeout(300000);
   next();
@@ -38,13 +38,13 @@ app.get("/", (req, res) => {
   res.send("FFmpeg service running 🚀");
 });
 
-// 🧠 Scene sorting
+// 🧠 Sort scenes
 const extractSceneNumber = (str) => {
   const match = str.match(/(\d+)/g);
   return match ? parseInt(match.pop(), 10) : Number.MAX_SAFE_INTEGER;
 };
 
-// ⚠️ FIX: convert Cloudinary player URLs → direct video URL
+// 🔗 Normalize Cloudinary URLs
 const normalizeUrl = (url) => {
   if (url.includes("player.cloudinary.com")) {
     const match = url.match(/public_id=([^&]+)/);
@@ -111,17 +111,30 @@ app.post("/merge", auth, async (req, res) => {
 
     const outputPath = path.join(tempDir, "output.mp4");
 
-    // 🎥 FIXED FILTER BUILDER
+    // 🎥 BUILD FILTER GRAPH (VIDEO + AUDIO SAFE)
     const filterParts = [];
 
-    // Step 1: normalize each clip
     localClips.forEach((_, i) => {
-      filterParts.push(`[${i}:v]scale=480:-2,setsar=1[v${i}]`);
+      // 🎥 Normalize video
+      filterParts.push(
+        `[${i}:v]scale=480:854:force_original_aspect_ratio=decrease,` +
+        `pad=480:854:(ow-iw)/2:(oh-ih)/2,` +
+        `fps=24,format=yuv420p,setsar=1[v${i}]`
+      );
+
+      // 🔊 Normalize audio (even if missing)
+      filterParts.push(
+        `[${i}:a]aformat=sample_rates=44100:channel_layouts=stereo[a${i}]`
+      );
     });
 
-    // Step 2: concat inputs
-    const concatInputs = localClips.map((_, i) => `[v${i}]`).join("");
-    filterParts.push(`${concatInputs}concat=n=${localClips.length}:v=1:a=0[outv]`);
+    const videoInputs = localClips.map((_, i) => `[v${i}]`).join("");
+    const audioInputs = localClips.map((_, i) => `[a${i}]`).join("");
+
+    // 🎬 CONCAT WITH AUDIO
+    filterParts.push(
+      `${videoInputs}${audioInputs}concat=n=${localClips.length}:v=1:a=1[outv][outa]`
+    );
 
     const filter = filterParts.join(";");
 
@@ -130,13 +143,21 @@ app.post("/merge", auth, async (req, res) => {
     const ffmpegArgs = [
       "-y",
       ...localClips.flatMap((clip) => ["-i", clip]),
+
       "-filter_complex", filter,
+
       "-map", "[outv]",
+      "-map", "[outa]",
+
       "-c:v", "libx264",
-      "-preset", "ultrafast",
-      "-crf", "28",
-      "-r", "24",
-      "-pix_fmt", "yuv420p",
+      "-preset", "veryfast",
+      "-crf", "23",
+
+      "-c:a", "aac",
+      "-b:a", "128k",
+
+      "-movflags", "+faststart",
+
       outputPath,
     ];
 
@@ -149,9 +170,7 @@ app.post("/merge", auth, async (req, res) => {
         console.log(data.toString());
       });
 
-      ffmpeg.on("error", (err) => {
-        reject(err);
-      });
+      ffmpeg.on("error", reject);
 
       ffmpeg.on("close", (code) => {
         if (code !== 0) {
