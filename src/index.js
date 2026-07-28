@@ -120,6 +120,7 @@ const downloadFile = async (url, outputPath) => {
     url: cleanUrl,
     responseType: "stream",
     timeout: 60000,
+    validateStatus: s => s < 400
   });
 
   await new Promise((resolve, reject) => {
@@ -128,6 +129,10 @@ const downloadFile = async (url, outputPath) => {
     writer.on("finish", resolve);
     writer.on("error", reject);
   });
+
+  if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) {
+    throw new Error("Downloaded file invalid or empty");
+  }
 };
 
 // ================= FFMPEG =================
@@ -150,7 +155,6 @@ const runFFmpeg = (args, jobId, webhook) => {
 
         updateJob(jobId, { progress });
 
-        // 🔥 LIVE PROGRESS → n8n
         await sendWebhook(webhook, {
           jobId,
           status: "processing",
@@ -161,10 +165,30 @@ const runFFmpeg = (args, jobId, webhook) => {
 
     ffmpeg.on("close", code => {
       clearTimeout(timeout);
-      if (code !== 0) return reject(new Error(`FFmpeg exit ${code}`));
+      if (code !== 0) {
+        log("ffmpeg_failed", { code });
+        return reject(new Error(`FFmpeg exit ${code}`));
+      }
       resolve();
     });
   });
+};
+
+// ================= NORMALIZE =================
+const normalizeClip = async (input, output, jobId, webhook) => {
+  await runFFmpeg([
+    "-y",
+    "-i", input,
+    "-vf", `scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT},fps=30`,
+    "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
+    "-preset", "veryfast",
+    "-crf", "23",
+    "-c:a", "aac",
+    "-ar", "44100",
+    "-ac", "2",
+    "-movflags", "+faststart",
+    output
+  ], jobId, webhook);
 };
 
 // ================= ROUTES =================
@@ -194,10 +218,9 @@ app.post("/merge", auth, async (req, res) => {
   jobLimit(async () => {
     let tempDir;
 
-    let { clips, webhook, transition = "none" } = req.body;
+    let { clips, webhook } = req.body;
 
     try {
-      // 🔥 START EVENT
       await sendWebhook(webhook, {
         jobId: requestId,
         status: "started"
@@ -206,6 +229,8 @@ app.post("/merge", auth, async (req, res) => {
       updateJob(requestId, { status: "processing" });
 
       if (!clips || clips.length < 2) throw new Error("Need at least 2 clips");
+
+      if (clips.length > MAX_CLIPS) throw new Error("Too many clips");
 
       clips = clips.sort(
         (a, b) => extractSceneNumber(a) - extractSceneNumber(b)
@@ -227,28 +252,29 @@ app.post("/merge", auth, async (req, res) => {
         )
       );
 
-      updateJob(requestId, { step: "encoding" });
+      updateJob(requestId, { step: "normalizing" });
 
-      // ================= FILTER =================
-      let filter = "";
+      // ================= NORMALIZE =================
+      const normalized = [];
 
-      if (transition === "fade" && localClips.length >= 2) {
-        filter = `
-        [0:v][1:v]xfade=transition=fade:duration=1:offset=4[v];
-        [0:a][1:a]acrossfade=d=1[a]
-        `;
-      } else {
-        const v = localClips.map((_, i) => `[${i}:v]`).join("");
-        const a = localClips.map((_, i) => `[${i}:a?]`).join("");
-
-        filter = `${v}${a}concat=n=${localClips.length}:v=1:a=1[outv][outa]`;
+      for (let i = 0; i < localClips.length; i++) {
+        const out = path.join(tempDir, `norm_${i}.mp4`);
+        await normalizeClip(localClips[i], out, requestId, webhook);
+        normalized.push(out);
       }
+
+      updateJob(requestId, { step: "merging" });
+
+      // ================= CONCAT =================
+      const filter =
+        normalized.map((_, i) => `[${i}:v][${i}:a]`).join("") +
+        `concat=n=${normalized.length}:v=1:a=1[outv][outa]`;
 
       const outputPath = path.join(tempDir, "output.mp4");
 
       await runFFmpeg([
         "-y",
-        ...localClips.flatMap(c => ["-i", c]),
+        ...normalized.flatMap(c => ["-i", c]),
         "-filter_complex", filter,
         "-map", "[outv]",
         "-map", "[outa]",
@@ -278,7 +304,6 @@ app.post("/merge", auth, async (req, res) => {
 
       jobs.set(requestId, { ...jobs.get(requestId), ...result });
 
-      // 🔥 SUCCESS EVENT
       await sendWebhook(webhook, result);
 
     } catch (err) {
@@ -293,7 +318,6 @@ app.post("/merge", auth, async (req, res) => {
         ...failPayload
       });
 
-      // 🔥 FAILURE EVENT
       await sendWebhook(webhook, failPayload);
 
       if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
