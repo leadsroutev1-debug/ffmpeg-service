@@ -29,8 +29,8 @@ const USE_GPU = process.env.USE_GPU === "true";
 // socket, depending on plan/network). This pipeline concatenates
 // multiple normalized+effected clips into one output.mp4, so it's easy
 // to blow past 100MB on longer episodes/scenes. Chunked upload
-// (upload_large_stream) fixes that by streaming the file in
-// CLOUDINARY_CHUNK_SIZE-byte pieces instead of one request.
+// (upload_large / upload_large_stream) fixes that by streaming the file
+// in CLOUDINARY_CHUNK_SIZE-byte pieces instead of one request.
 const CLOUDINARY_CHUNK_SIZE = parseInt(process.env.CLOUDINARY_CHUNK_SIZE || "20000000", 10); // 20MB default
 const CLOUDINARY_UPLOAD_TIMEOUT = parseInt(process.env.CLOUDINARY_UPLOAD_TIMEOUT || "600000", 10); // 10 min
 
@@ -875,13 +875,12 @@ const parseClipEntry = (entry) => {
 };
 
 // ================= CLOUDINARY UPLOAD (FIXED) =================
-// ✅ FIX: use upload_large_stream (chunked upload) instead of upload_stream
-// (single non-chunked request, ~100MB cap on most plans). Chunk size and
-// timeout are configurable via env vars. The read stream now has its own
-// error handler so a disk/IO failure rejects the promise instead of
-// hanging it forever. Also validates the local file exists/non-empty
-// before attempting the upload, so we fail fast with a clear message
-// instead of a confusing Cloudinary error.
+// ✅ FIX: the installed cloudinary SDK version on this deploy does not
+// expose `upload_large_stream` ("upload_large_stream is not a function").
+// `upload_large` has been part of the SDK far longer, takes the local file
+// path directly, and still auto-chunks the upload in CLOUDINARY_CHUNK_SIZE
+// pieces -- same fix for the >100MB single-request cap, without needing to
+// pipe a manual read stream.
 const uploadToCloudinary = (outputPath, uploadFolder) => {
   return new Promise((resolve, reject) => {
     if (!fs.existsSync(outputPath)) {
@@ -894,7 +893,8 @@ const uploadToCloudinary = (outputPath, uploadFolder) => {
 
     log("cloudinary_upload_start", { path: outputPath, sizeBytes: size, folder: uploadFolder });
 
-    const stream = cloudinary.uploader.upload_large_stream(
+    cloudinary.uploader.upload_large(
+      outputPath,
       {
         resource_type: "video",
         folder: uploadFolder,
@@ -914,24 +914,6 @@ const uploadToCloudinary = (outputPath, uploadFolder) => {
         resolve(result);
       }
     );
-
-    const readStream = fs.createReadStream(outputPath);
-
-    // Without this, a read-side error (e.g. disk issue, file removed
-    // mid-upload) would leave the upload_large_stream callback never
-    // firing, and the whole job would hang until FFMPEG_TIMEOUT-unrelated
-    // infinity instead of failing cleanly.
-    readStream.on("error", (err) => {
-      log("cloudinary_upload_read_stream_error", { error: err.message });
-      reject(err);
-    });
-
-    stream.on("error", (err) => {
-      log("cloudinary_upload_stream_error", { error: err.message });
-      reject(err);
-    });
-
-    readStream.pipe(stream);
   });
 };
 
