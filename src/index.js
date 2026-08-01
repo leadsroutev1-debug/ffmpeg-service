@@ -396,33 +396,480 @@ const composeZoom = async (normalized, outputPath, jobId, webhook) => {
   ], jobId, webhook);
 };
 
+// ============================================================
+// ================= STUDIO EFFECTS CATALOG (NEW) =============
+// ============================================================
+// Everything in this section is additive and opt-in. If a caller sends the
+// exact same payloads as before (plain string arrays, no `effects`/`opts`
+// fields), none of this code path executes and output is byte-identical to
+// the original pipeline. New callers can opt into per-clip motion/color/
+// overlay effects, cross-fade transitions between clips, and new composite
+// layouts, all addressed by name so n8n/Director can pick them from a list
+// (see GET /effects).
+
+// ---- Transitions (56) -----------------------------------------------
+// These map 1:1 to ffmpeg's native `xfade` transition names, so they're
+// real, battle-tested GPU/CPU-friendly cross-dissolve/wipe/slide effects,
+// not reinvented ones.
+const TRANSITIONS = [
+  "fade", "fadeblack", "fadewhite", "distance",
+  "wipeleft", "wiperight", "wipeup", "wipedown",
+  "slideleft", "slideright", "slideup", "slidedown",
+  "smoothleft", "smoothright", "smoothup", "smoothdown",
+  "circlecrop", "rectcrop", "circleopen", "circleclose",
+  "vertopen", "vertclose", "horzopen", "horzclose",
+  "dissolve", "pixelize",
+  "diagtl", "diagtr", "diagbl", "diagbr",
+  "hlslice", "hrslice", "vuslice", "vdslice",
+  "hblur", "fadegrays",
+  "wipetl", "wipetr", "wipebl", "wipebr",
+  "squeezeh", "squeezev", "zoomin",
+  "hlwind", "hrwind", "vuwind", "vdwind",
+  "coverleft", "coverright", "coverup", "coverdown",
+  "revealleft", "revealright", "revealup", "revealdown"
+];
+
+// ---- Motion / animation effects (18) ---------------------------------
+// Applied to a single already-normalized clip. Each entry returns
+// { vf, af } -- af is only present for effects that change playback speed
+// (audio has to move in lockstep or it drifts out of sync).
+const MOTION_EFFECTS = {
+  zoom_in: (dur) => {
+    const frames = Math.max(1, Math.round(dur * OUTPUT_FPS));
+    return { vf: `zoompan=z='min(zoom+${ZOOM_RATE},${ZOOM_MAX})':d=${frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}:fps=${OUTPUT_FPS}` };
+  },
+  zoom_out: (dur) => {
+    const frames = Math.max(1, Math.round(dur * OUTPUT_FPS));
+    return { vf: `zoompan=z='if(eq(on,0),${ZOOM_MAX},max(zoom-${ZOOM_RATE},1))':d=${frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}:fps=${OUTPUT_FPS}` };
+  },
+  kenburns_left: (dur) => ({
+    vf: `scale=${Math.round(OUTPUT_WIDTH * 1.15)}:${Math.round(OUTPUT_HEIGHT * 1.15)},crop=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:x='(iw-ow)*(1-t/${Math.max(dur, 0.1).toFixed(3)})':y='(ih-oh)/2'`
+  }),
+  kenburns_right: (dur) => ({
+    vf: `scale=${Math.round(OUTPUT_WIDTH * 1.15)}:${Math.round(OUTPUT_HEIGHT * 1.15)},crop=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:x='(iw-ow)*(t/${Math.max(dur, 0.1).toFixed(3)})':y='(ih-oh)/2'`
+  }),
+  pan_left: (dur) => ({
+    vf: `scale=${Math.round(OUTPUT_WIDTH * 1.12)}:${OUTPUT_HEIGHT},crop=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:x='(iw-ow)*(1-t/${Math.max(dur, 0.1).toFixed(3)})':y=0`
+  }),
+  pan_right: (dur) => ({
+    vf: `scale=${Math.round(OUTPUT_WIDTH * 1.12)}:${OUTPUT_HEIGHT},crop=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:x='(iw-ow)*(t/${Math.max(dur, 0.1).toFixed(3)})':y=0`
+  }),
+  pan_up: (dur) => ({
+    vf: `scale=${OUTPUT_WIDTH}:${Math.round(OUTPUT_HEIGHT * 1.12)},crop=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:x=0:y='(ih-oh)*(1-t/${Math.max(dur, 0.1).toFixed(3)})'`
+  }),
+  pan_down: (dur) => ({
+    vf: `scale=${OUTPUT_WIDTH}:${Math.round(OUTPUT_HEIGHT * 1.12)},crop=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:x=0:y='(ih-oh)*(t/${Math.max(dur, 0.1).toFixed(3)})'`
+  }),
+  shake_handheld: () => ({
+    vf: `scale=${OUTPUT_WIDTH + 24}:${OUTPUT_HEIGHT + 24},crop=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:x='12+6*sin(2*PI*t*2)':y='12+6*cos(2*PI*t*1.7)'`
+  }),
+  rotate_slight: () => ({
+    vf: `rotate='(2*PI/180)*sin(2*PI*t/4)':ow=iw:oh=ih:fillcolor=black`
+  }),
+  dutch_angle_left: () => ({
+    vf: `rotate=-6*PI/180:ow=iw:oh=ih:fillcolor=black`
+  }),
+  dutch_angle_right: () => ({
+    vf: `rotate=6*PI/180:ow=iw:oh=ih:fillcolor=black`
+  }),
+  slow_motion_2x: () => ({
+    vf: `setpts=2.0*PTS`, af: `atempo=0.5`
+  }),
+  slow_motion_4x: () => ({
+    vf: `setpts=4.0*PTS`, af: `atempo=0.5,atempo=0.5`
+  }),
+  fast_forward_2x: () => ({
+    vf: `setpts=0.5*PTS`, af: `atempo=2.0`
+  }),
+  fast_forward_4x: () => ({
+    vf: `setpts=0.25*PTS`, af: `atempo=2.0,atempo=2.0`
+  }),
+  reverse_clip: () => ({
+    vf: `reverse`, af: `areverse`
+  }),
+  mirror_flip: () => ({ vf: `hflip` }),
+  vertical_flip: () => ({ vf: `vflip` })
+};
+
+// ---- Color grades (26) ------------------------------------------------
+// A mix of hand-tuned filter chains and ffmpeg's built-in `curves` presets
+// (cross_process, vintage, negative, etc. are native curves presets, not
+// approximations).
+const COLOR_GRADES = {
+  cinematic_teal_orange: `colorbalance=rs=-0.12:gs=0.03:bs=0.15:rm=-0.06:bm=0.1:rh=0.08:bh=-0.05,eq=contrast=1.12:saturation=1.1`,
+  noir_bw: `hue=s=0,eq=contrast=1.3:brightness=-0.02`,
+  sepia_vintage: `colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131`,
+  bleach_bypass: `eq=saturation=0.4:contrast=1.3`,
+  high_contrast: `eq=contrast=1.5`,
+  desaturated: `eq=saturation=0.3`,
+  warm_golden: `colorbalance=rm=0.15:gm=0.05:bm=-0.1`,
+  cool_blue: `colorbalance=bm=0.2:rm=-0.1`,
+  vintage_curve: `curves=preset=vintage`,
+  cross_process: `curves=preset=cross_process`,
+  strong_contrast: `curves=preset=strong_contrast`,
+  negative: `curves=preset=negative`,
+  color_negative: `curves=preset=color_negative`,
+  darker: `curves=preset=darker`,
+  lighter: `curves=preset=lighter`,
+  linear_contrast: `curves=preset=linear_contrast`,
+  medium_contrast: `curves=preset=medium_contrast`,
+  increase_contrast: `curves=preset=increase_contrast`,
+  dreamy_soft: `gblur=sigma=1.5,eq=brightness=0.04:contrast=0.95`,
+  moody_dark: `eq=brightness=-0.08:contrast=1.2:saturation=0.7`,
+  technicolor: `eq=saturation=1.8:contrast=1.2`,
+  infrared_look: `colorchannelmixer=0:0:1:0:0:1:0:0:1:0:0:0`,
+  matrix_green: `colorchannelmixer=0.1:0.9:0:0:0:0.9:0.1:0:0.1:0:0.8:0`,
+  faded_polaroid: `curves=preset=vintage,eq=contrast=0.9:brightness=0.05`,
+  sunset_glow: `colorbalance=rm=0.2:gm=0.05,eq=brightness=0.03`,
+  horror_green: `colorbalance=gm=0.3:rm=-0.2,eq=contrast=1.15`
+};
+
+// ---- Overlay effects (8) -----------------------------------------------
+const OVERLAY_EFFECTS = {
+  vignette_dark: `vignette=PI/4`,
+  film_grain: `noise=alls=20:allf=t+u`,
+  dust_scratches: `noise=alls=8:allf=t+u`,
+  vhs_overlay: `noise=alls=10:allf=t,rgbashift=rh=1:bh=-1`,
+  scanlines: `drawgrid=width=iw:height=4:thickness=1:color=black@0.25`,
+  letterbox_cinematic: `drawbox=x=0:y=0:w=iw:h=ih*0.12:color=black@1:t=fill,drawbox=x=0:y=ih*0.88:w=iw:h=ih*0.12:color=black@1:t=fill`,
+  chromatic_aberration: `rgbashift=rh=2:bh=-2`,
+  light_leak_warm: `vignette=PI/6:mode=backward,eq=brightness=0.03:saturation=1.1`
+};
+
+// ---- Composite layouts added to the original 4 (cut/overlay/split/zoom):
+//   grid4, triptych, pip  --> 7 total layouts
+
+const escapeDrawtext = (text) =>
+  String(text).replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\\'");
+
+const buildDrawText = ({ text, position = "bottom", fontSize = 36, fontColor = "white" }) => {
+  const safe = escapeDrawtext(text);
+  const yExpr =
+    position === "top" ? "40" :
+    position === "center" ? "(h-text_h)/2" :
+    "h-text_h-40";
+  return `drawtext=text='${safe}':fontcolor=${fontColor}:fontsize=${fontSize}:box=1:boxcolor=black@0.5:boxborderw=10:x=(w-text_w)/2:y=${yExpr}`;
+};
+
+// Combines an optional motion effect + color grade + list of overlay
+// effects for ONE clip into a single { vf, af } pair. Unknown names are
+// logged and skipped rather than failing the whole job.
+const buildEffectFilterChain = (spec, duration) => {
+  const vfParts = [];
+  const afParts = [];
+
+  if (spec?.motion) {
+    const fn = MOTION_EFFECTS[spec.motion];
+    if (fn) {
+      const { vf, af } = fn(duration);
+      if (vf) vfParts.push(vf);
+      if (af) afParts.push(af);
+    } else {
+      log("unknown_motion_effect_skipped", { name: spec.motion });
+    }
+  }
+
+  if (spec?.colorGrade) {
+    const grade = COLOR_GRADES[spec.colorGrade];
+    if (grade) vfParts.push(grade);
+    else log("unknown_color_grade_skipped", { name: spec.colorGrade });
+  }
+
+  if (Array.isArray(spec?.overlays)) {
+    for (const name of spec.overlays) {
+      const ov = OVERLAY_EFFECTS[name];
+      if (ov) vfParts.push(ov);
+      else log("unknown_overlay_skipped", { name });
+    }
+  }
+
+  return { vf: vfParts.join(","), af: afParts.join(",") };
+};
+
+// Applies a per-clip effects spec to one normalized clip. If the spec is
+// empty, just copies the file through untouched (cheap, no re-encode).
+const applyClipEffects = async (input, output, spec, jobId, webhook) => {
+  const hasEffects = spec && (spec.motion || spec.colorGrade || (spec.overlays && spec.overlays.length));
+  if (!hasEffects) {
+    fs.copyFileSync(input, output);
+    return;
+  }
+
+  const duration = await getDuration(input);
+  const { vf, af } = buildEffectFilterChain(spec, duration);
+
+  const args = ["-y", "-i", input];
+  if (vf) args.push("-vf", vf);
+  args.push("-c:v", USE_GPU ? "h264_nvenc" : "libx264", "-preset", "veryfast", "-crf", "23");
+  if (af) {
+    args.push("-af", af, "-c:a", "aac");
+  } else {
+    args.push("-c:a", "copy");
+  }
+  args.push("-movflags", "+faststart", output);
+
+  await runFFmpeg(args, jobId, webhook);
+};
+
+// cut with cross-fade transitions: chains xfade (video) + acrossfade
+// (audio) across N clips instead of a hard concat. Falls back to plain
+// composeCut if no transition is requested.
+const composeCutTransition = async (normalized, outputPath, jobId, webhook, transitionName, transitionDuration) => {
+  if (normalized.length === 1) {
+    fs.copyFileSync(normalized[0], outputPath);
+    return;
+  }
+
+  const durations = [];
+  for (const c of normalized) durations.push(await getDuration(c));
+
+  const td = Math.max(0.1, Math.min(transitionDuration || 0.5, Math.min(...durations) / 2));
+
+  const filterParts = [];
+  const audioParts = [];
+  let cumulative = durations[0];
+  let vLabel = "0:v";
+  let aLabel = "0:a";
+
+  for (let i = 1; i < normalized.length; i++) {
+    const offset = Math.max(0, cumulative - td);
+    const isLast = i === normalized.length - 1;
+    const outV = isLast ? "outv" : `v${i}`;
+    const outA = isLast ? "outa" : `a${i}`;
+
+    filterParts.push(`[${vLabel}][${i}:v]xfade=transition=${transitionName}:duration=${td.toFixed(3)}:offset=${offset.toFixed(3)}[${outV}]`);
+    audioParts.push(`[${aLabel}][${i}:a]acrossfade=d=${td.toFixed(3)}[${outA}]`);
+
+    vLabel = outV;
+    aLabel = outA;
+    cumulative = offset + durations[i];
+  }
+
+  const filter = [...filterParts, ...audioParts].join(";");
+
+  await runFFmpeg([
+    "-y",
+    ...normalized.flatMap(c => ["-i", c]),
+    "-filter_complex", filter,
+    "-map", "[outv]",
+    "-map", "[outa]",
+    "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
+    "-preset", "veryfast",
+    "-crf", "23",
+    "-c:a", "aac",
+    "-movflags", "+faststart",
+    outputPath
+  ], jobId, webhook);
+};
+
+const composeCutOrTransition = async (normalized, outputPath, jobId, webhook, opts = {}) => {
+  if (opts.transition && TRANSITIONS.includes(opts.transition) && normalized.length > 1) {
+    return composeCutTransition(normalized, outputPath, jobId, webhook, opts.transition, opts.transitionDuration);
+  }
+  return composeCut(normalized, outputPath, jobId, webhook);
+};
+
+// grid4: exactly 4 clips in a 2x2 grid, audio mixed from all 4.
+const composeGrid4 = async (normalized, outputPath, jobId, webhook) => {
+  const halfW = Math.floor(OUTPUT_WIDTH / 2);
+  const halfH = Math.floor(OUTPUT_HEIGHT / 2);
+
+  const filter =
+    `[0:v]scale=${halfW}:${halfH}[tl];` +
+    `[1:v]scale=${halfW}:${halfH}[tr];` +
+    `[2:v]scale=${halfW}:${halfH}[bl];` +
+    `[3:v]scale=${halfW}:${halfH}[br];` +
+    `[tl][tr]hstack=inputs=2[top];` +
+    `[bl][br]hstack=inputs=2[bottom];` +
+    `[top][bottom]vstack=inputs=2[outv];` +
+    `[0:a][1:a][2:a][3:a]amix=inputs=4:duration=shortest:dropout_transition=0[outa]`;
+
+  await runFFmpeg([
+    "-y",
+    ...normalized.slice(0, 4).flatMap(c => ["-i", c]),
+    "-filter_complex", filter,
+    "-map", "[outv]",
+    "-map", "[outa]",
+    "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
+    "-preset", "veryfast",
+    "-crf", "23",
+    "-c:a", "aac",
+    "-movflags", "+faststart",
+    outputPath
+  ], jobId, webhook);
+};
+
+// triptych: exactly 3 clips side by side (160px columns at 480 width).
+const composeTriptych = async (normalized, outputPath, jobId, webhook) => {
+  const colW = Math.floor(OUTPUT_WIDTH / 3);
+
+  const filter =
+    `[0:v]scale=${colW}:${OUTPUT_HEIGHT}[a];` +
+    `[1:v]scale=${colW}:${OUTPUT_HEIGHT}[b];` +
+    `[2:v]scale=${OUTPUT_WIDTH - colW * 2}:${OUTPUT_HEIGHT}[c];` +
+    `[a][b][c]hstack=inputs=3[outv];` +
+    `[0:a][1:a][2:a]amix=inputs=3:duration=shortest:dropout_transition=0[outa]`;
+
+  await runFFmpeg([
+    "-y",
+    ...normalized.slice(0, 3).flatMap(c => ["-i", c]),
+    "-filter_complex", filter,
+    "-map", "[outv]",
+    "-map", "[outa]",
+    "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
+    "-preset", "veryfast",
+    "-crf", "23",
+    "-c:a", "aac",
+    "-movflags", "+faststart",
+    outputPath
+  ], jobId, webhook);
+};
+
+// pip: base clip full-frame for its whole duration, second clip as a
+// picture-in-picture box in a configurable corner, for the whole duration
+// (unlike "overlay", which time-slices multiple overlay clips).
+const composePipCustom = async (normalized, outputPath, jobId, webhook, opts = {}) => {
+  const [base, pip] = normalized;
+  const scale = opts.pipScale || OVERLAY_SCALE;
+  const boxW = Math.round(OUTPUT_WIDTH * scale);
+  const boxH = Math.round(OUTPUT_HEIGHT * scale);
+  const corner = opts.pipCorner || "bottom-right";
+
+  const positions = {
+    "top-left": [OVERLAY_MARGIN, OVERLAY_MARGIN],
+    "top-right": [OUTPUT_WIDTH - boxW - OVERLAY_MARGIN, OVERLAY_MARGIN],
+    "bottom-left": [OVERLAY_MARGIN, OUTPUT_HEIGHT - boxH - OVERLAY_MARGIN],
+    "bottom-right": [OUTPUT_WIDTH - boxW - OVERLAY_MARGIN, OUTPUT_HEIGHT - boxH - OVERLAY_MARGIN],
+    "center": [Math.round((OUTPUT_WIDTH - boxW) / 2), Math.round((OUTPUT_HEIGHT - boxH) / 2)]
+  };
+  const [x, y] = positions[corner] || positions["bottom-right"];
+
+  const useAmix = !!opts.pipAudio;
+  const filter = useAmix
+    ? `[1:v]scale=${boxW}:${boxH}[pv];[0:v][pv]overlay=${x}:${y}[outv];[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0[outa]`
+    : `[1:v]scale=${boxW}:${boxH}[pv];[0:v][pv]overlay=${x}:${y}[outv]`;
+
+  await runFFmpeg([
+    "-y",
+    "-i", base,
+    "-i", pip,
+    "-filter_complex", filter,
+    "-map", "[outv]",
+    "-map", useAmix ? "[outa]" : "0:a",
+    "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
+    "-preset", "veryfast",
+    "-crf", "23",
+    "-c:a", "aac",
+    "-movflags", "+faststart",
+    outputPath
+  ], jobId, webhook);
+};
+
+// Final, whole-video post-process: global color grade, global overlays,
+// and/or a text card. Skipped (cheap copy) if none of those were requested.
+const buildFinalFilterChain = (opts = {}) => {
+  const vfParts = [];
+  if (opts.finalColorGrade && COLOR_GRADES[opts.finalColorGrade]) {
+    vfParts.push(COLOR_GRADES[opts.finalColorGrade]);
+  } else if (opts.finalColorGrade) {
+    log("unknown_final_color_grade_skipped", { name: opts.finalColorGrade });
+  }
+  if (Array.isArray(opts.finalOverlays)) {
+    for (const name of opts.finalOverlays) {
+      const ov = OVERLAY_EFFECTS[name];
+      if (ov) vfParts.push(ov);
+      else log("unknown_final_overlay_skipped", { name });
+    }
+  }
+  if (opts.textOverlay?.text) {
+    vfParts.push(buildDrawText(opts.textOverlay));
+  }
+  return vfParts.join(",");
+};
+
+const applyFinalEffects = async (input, output, opts, jobId, webhook) => {
+  const chain = buildFinalFilterChain(opts);
+  if (!chain) {
+    fs.copyFileSync(input, output);
+    return;
+  }
+  await runFFmpeg([
+    "-y",
+    "-i", input,
+    "-vf", chain,
+    "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
+    "-preset", "veryfast",
+    "-crf", "23",
+    "-c:a", "copy",
+    "-movflags", "+faststart",
+    output
+  ], jobId, webhook);
+};
+
 // Resolves the requested layout to a compose function, applying sane
 // fallbacks (documented on the n8n side too) rather than failing the whole
-// scene over a layout/clip-count mismatch.
-const resolveComposer = (layout, clipCount) => {
+// scene over a layout/clip-count mismatch. `opts` carries layout-specific
+// extras (transition name/duration, pip corner/scale/audio).
+const resolveComposer = (layout, clipCount, opts = {}) => {
   switch (layout) {
     case "split":
       if (clipCount !== 2) {
         log("split_layout_wrong_clip_count_falling_back_to_cut", { clipCount });
-        return { fn: composeCut, usedLayout: "cut" };
+        return { fn: (n, o, j, w) => composeCutOrTransition(n, o, j, w, opts), usedLayout: "cut" };
       }
       return { fn: composeSplit, usedLayout: "split" };
     case "overlay":
       return { fn: composeOverlay, usedLayout: "overlay" };
     case "zoom":
       return { fn: composeZoom, usedLayout: "zoom" };
+    case "grid4":
+      if (clipCount !== 4) {
+        log("grid4_layout_wrong_clip_count_falling_back_to_cut", { clipCount });
+        return { fn: (n, o, j, w) => composeCutOrTransition(n, o, j, w, opts), usedLayout: "cut" };
+      }
+      return { fn: composeGrid4, usedLayout: "grid4" };
+    case "triptych":
+      if (clipCount !== 3) {
+        log("triptych_layout_wrong_clip_count_falling_back_to_cut", { clipCount });
+        return { fn: (n, o, j, w) => composeCutOrTransition(n, o, j, w, opts), usedLayout: "cut" };
+      }
+      return { fn: composeTriptych, usedLayout: "triptych" };
+    case "pip":
+      if (clipCount !== 2) {
+        log("pip_layout_wrong_clip_count_falling_back_to_cut", { clipCount });
+        return { fn: (n, o, j, w) => composeCutOrTransition(n, o, j, w, opts), usedLayout: "cut" };
+      }
+      return { fn: (n, o, j, w) => composePipCustom(n, o, j, w, opts), usedLayout: "pip" };
     case "cut":
     default:
-      return { fn: composeCut, usedLayout: "cut" };
+      return { fn: (n, o, j, w) => composeCutOrTransition(n, o, j, w, opts), usedLayout: "cut" };
   }
+};
+
+const LAYOUTS = ["cut", "overlay", "split", "zoom", "grid4", "triptych", "pip"];
+
+// Turns a raw clip entry (string OR {url, motion, colorGrade, overlays})
+// into a normalized { url, effects } shape. Old-style string arrays keep
+// working exactly as before -- effects is just null for them.
+const parseClipEntry = (entry) => {
+  if (typeof entry === "string") return { url: entry, effects: null };
+  return {
+    url: entry.url,
+    effects: {
+      motion: entry.motion || null,
+      colorGrade: entry.colorGrade || null,
+      overlays: Array.isArray(entry.overlays) ? entry.overlays : []
+    }
+  };
 };
 
 // ================= SHARED JOB PIPELINE =================
 // Both /merge and /compose do the same thing end to end -- queue, download,
-// normalize, run one ffmpeg composition step, upload, report -- so that
-// pipeline lives in one place and each route just supplies the ordering
-// rule, the composer, and the upload folder.
-const runClipJob = ({ requestId, clips, webhook, minClips, maxClips, sortClips, composerFor, uploadFolder }) => {
+// normalize, [optional per-clip effects], run one ffmpeg composition step,
+// [optional final effects], upload, report -- so that pipeline lives in one
+// place and each route just supplies the ordering rule, the composer, and
+// the upload folder.
+const runClipJob = ({ requestId, clips, webhook, minClips, maxClips, sortClips, composerFor, uploadFolder, opts = {} }) => {
   jobLimit(async () => {
     let tempDir;
 
@@ -435,7 +882,10 @@ const runClipJob = ({ requestId, clips, webhook, minClips, maxClips, sortClips, 
       }
       if (clips.length > maxClips) throw new Error("Too many clips");
 
-      const ordered = sortClips ? [...clips].sort((a, b) => extractTrailingNumber(a) - extractTrailingNumber(b)) : clips;
+      const parsed = clips.map(parseClipEntry);
+      const ordered = sortClips
+        ? [...parsed].sort((a, b) => extractTrailingNumber(a.url) - extractTrailingNumber(b.url))
+        : parsed;
 
       tempDir = path.join(os.tmpdir(), requestId);
       fs.mkdirSync(tempDir, { recursive: true });
@@ -443,10 +893,10 @@ const runClipJob = ({ requestId, clips, webhook, minClips, maxClips, sortClips, 
       // ================= DOWNLOAD =================
       const limit = pLimit(DOWNLOAD_CONCURRENCY);
       const localClips = await Promise.all(
-        ordered.map((url, i) =>
+        ordered.map((clip, i) =>
           limit(async () => {
             const file = path.join(tempDir, `clip_${i}.mp4`);
-            await downloadFile(url, file);
+            await downloadFile(clip.url, file);
             return file;
           })
         )
@@ -455,10 +905,19 @@ const runClipJob = ({ requestId, clips, webhook, minClips, maxClips, sortClips, 
       updateJob(requestId, { step: "normalizing" });
 
       // ================= NORMALIZE =================
-      const normalized = [];
+      const normalizedRaw = [];
       for (let i = 0; i < localClips.length; i++) {
         const out = path.join(tempDir, `norm_${i}.mp4`);
         await normalizeClip(localClips[i], out, requestId, webhook);
+        normalizedRaw.push(out);
+      }
+
+      // ================= PER-CLIP EFFECTS (NEW, opt-in) =================
+      updateJob(requestId, { step: "applying_effects" });
+      const normalized = [];
+      for (let i = 0; i < normalizedRaw.length; i++) {
+        const out = path.join(tempDir, `fx_${i}.mp4`);
+        await applyClipEffects(normalizedRaw[i], out, ordered[i].effects, requestId, webhook);
         normalized.push(out);
       }
 
@@ -466,8 +925,13 @@ const runClipJob = ({ requestId, clips, webhook, minClips, maxClips, sortClips, 
 
       // ================= COMPOSE =================
       const { fn: composeFn, usedLayout } = composerFor(normalized.length);
+      const composedPath = path.join(tempDir, "composed.mp4");
+      await composeFn(normalized, composedPath, requestId, webhook);
+
+      // ================= FINAL EFFECTS (NEW, opt-in) =================
+      updateJob(requestId, { step: "finalizing" });
       const outputPath = path.join(tempDir, "output.mp4");
-      await composeFn(normalized, outputPath, requestId, webhook);
+      await applyFinalEffects(composedPath, outputPath, opts, requestId, webhook);
 
       updateJob(requestId, { step: "uploading" });
 
@@ -527,12 +991,32 @@ app.get("/jobs", auth, (_, res) => {
   res.json([...jobs.values()]);
 });
 
+// Lets n8n/Director introspect the full catalog instead of hardcoding names.
+app.get("/effects", auth, (_, res) => {
+  res.json({
+    layouts: LAYOUTS,
+    transitions: TRANSITIONS,
+    motionEffects: Object.keys(MOTION_EFFECTS),
+    colorGrades: Object.keys(COLOR_GRADES),
+    overlays: Object.keys(OVERLAY_EFFECTS)
+  });
+});
+
 // ================= MERGE (final episode: composed scene clips -> one video) =================
+// Body: { clips: (string | {url, motion, colorGrade, overlays})[], webhook?,
+//         transition?, transitionDuration?, finalColorGrade?, finalOverlays?, textOverlay? }
 app.post("/merge", auth, (req, res) => {
   const requestId = uuidv4();
   jobs.set(requestId, { id: requestId, status: "queued", progress: 0 });
 
-  const { clips, webhook } = req.body;
+  const { clips, webhook, transition, transitionDuration, finalColorGrade, finalOverlays, textOverlay } = req.body;
+
+  if (transition && !TRANSITIONS.includes(transition)) {
+    jobs.set(requestId, { id: requestId, status: "failed", error: `Unknown transition '${transition}'` });
+    return res.status(400).json({ error: "Invalid transition" });
+  }
+
+  const opts = { transition, transitionDuration, finalColorGrade, finalOverlays, textOverlay };
 
   runClipJob({
     requestId,
@@ -541,33 +1025,52 @@ app.post("/merge", auth, (req, res) => {
     minClips: 2,
     maxClips: MAX_CLIPS,
     sortClips: true, // scene_NNN URLs -- keep numeric-order safety net from v1
-    composerFor: () => ({ fn: composeCut, usedLayout: "cut" }),
+    composerFor: (clipCount) => resolveComposer("cut", clipCount, opts),
     uploadFolder: "ai-movies/episodes",
+    opts
   });
 
   res.json({ jobId: requestId, statusUrl: `/status/${requestId}` });
 });
 
 // ================= COMPOSE (one scene: shot clips -> one scene clip) =================
-// New endpoint required by the multiverse/variant n8n workflow. Body:
-//   { clips: string[], layout: "cut" | "overlay" | "split" | "zoom", webhook? }
+// Body:
+//   { clips: (string | {url, motion, colorGrade, overlays})[],
+//     layout: "cut" | "overlay" | "split" | "zoom" | "grid4" | "triptych" | "pip",
+//     webhook?, transition?, transitionDuration?,
+//     pipCorner?, pipScale?, pipAudio?,
+//     finalColorGrade?, finalOverlays?, textOverlay? }
 // Returns { jobId, statusUrl } immediately, same shape as /merge; poll
 // /status/:id for { status: "processing" | "done" | "failed", url, layout }.
 app.post("/compose", auth, (req, res) => {
   const requestId = uuidv4();
   jobs.set(requestId, { id: requestId, status: "queued", progress: 0 });
 
-  const { clips, webhook } = req.body;
+  const {
+    clips, webhook,
+    transition, transitionDuration,
+    pipCorner, pipScale, pipAudio,
+    finalColorGrade, finalOverlays, textOverlay
+  } = req.body;
   const layout = (req.body.layout || "cut").toLowerCase();
 
-  if (!["cut", "overlay", "split", "zoom"].includes(layout)) {
+  if (!LAYOUTS.includes(layout)) {
     jobs.set(requestId, {
       id: requestId,
       status: "failed",
-      error: `Unknown layout '${layout}'. Expected cut, overlay, split, or zoom.`
+      error: `Unknown layout '${layout}'. Expected one of: ${LAYOUTS.join(", ")}.`
     });
     return res.status(400).json({ error: "Invalid layout" });
   }
+
+  if (transition && !TRANSITIONS.includes(transition)) {
+    jobs.set(requestId, { id: requestId, status: "failed", error: `Unknown transition '${transition}'` });
+    return res.status(400).json({ error: "Invalid transition" });
+  }
+
+  const opts = { transition, transitionDuration, pipCorner, pipScale, pipAudio, finalColorGrade, finalOverlays, textOverlay };
+
+  const minClipsByLayout = { zoom: 1, split: 2, pip: 2, grid4: 4, triptych: 3, overlay: 2, cut: 2 };
 
   runClipJob({
     requestId,
@@ -576,11 +1079,12 @@ app.post("/compose", auth, (req, res) => {
     // shot clips arrive already ordered (shot_01, shot_02, ...) from the
     // n8n side's Cloudinary folder listing; re-sorting is a safety net,
     // same principle as /merge trusting scene_NNN numbering.
-    minClips: layout === "zoom" ? 1 : 2,
+    minClips: minClipsByLayout[layout] ?? 2,
     maxClips: MAX_CLIPS,
     sortClips: true,
-    composerFor: (clipCount) => resolveComposer(layout, clipCount),
+    composerFor: (clipCount) => resolveComposer(layout, clipCount, opts),
     uploadFolder: "ai-movies/scenes",
+    opts
   });
 
   res.json({ jobId: requestId, statusUrl: `/status/${requestId}` });
