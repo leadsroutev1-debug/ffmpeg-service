@@ -23,6 +23,17 @@ const OUTPUT_FPS = 30;
 
 const USE_GPU = process.env.USE_GPU === "true";
 
+// ✅ FIX: Cloudinary's plain `upload_stream` is a single non-chunked
+// multipart request, capped at 100MB on most plans -- anything larger
+// than that fails (vague "file too large" error, or a hung/timed-out
+// socket, depending on plan/network). This pipeline concatenates
+// multiple normalized+effected clips into one output.mp4, so it's easy
+// to blow past 100MB on longer episodes/scenes. Chunked upload
+// (upload_large_stream) fixes that by streaming the file in
+// CLOUDINARY_CHUNK_SIZE-byte pieces instead of one request.
+const CLOUDINARY_CHUNK_SIZE = parseInt(process.env.CLOUDINARY_CHUNK_SIZE || "20000000", 10); // 20MB default
+const CLOUDINARY_UPLOAD_TIMEOUT = parseInt(process.env.CLOUDINARY_UPLOAD_TIMEOUT || "600000", 10); // 10 min
+
 // Ken Burns zoom rate for the "zoom" composition layout. 0.0015/frame at
 // 30fps ramps to ~1.5x zoom over roughly 11-12s -- tune if your shots run
 // much longer or shorter than that.
@@ -863,6 +874,67 @@ const parseClipEntry = (entry) => {
   };
 };
 
+// ================= CLOUDINARY UPLOAD (FIXED) =================
+// ✅ FIX: use upload_large_stream (chunked upload) instead of upload_stream
+// (single non-chunked request, ~100MB cap on most plans). Chunk size and
+// timeout are configurable via env vars. The read stream now has its own
+// error handler so a disk/IO failure rejects the promise instead of
+// hanging it forever. Also validates the local file exists/non-empty
+// before attempting the upload, so we fail fast with a clear message
+// instead of a confusing Cloudinary error.
+const uploadToCloudinary = (outputPath, uploadFolder) => {
+  return new Promise((resolve, reject) => {
+    if (!fs.existsSync(outputPath)) {
+      return reject(new Error(`Upload source missing: ${outputPath}`));
+    }
+    const size = fs.statSync(outputPath).size;
+    if (size === 0) {
+      return reject(new Error(`Upload source is empty: ${outputPath}`));
+    }
+
+    log("cloudinary_upload_start", { path: outputPath, sizeBytes: size, folder: uploadFolder });
+
+    const stream = cloudinary.uploader.upload_large_stream(
+      {
+        resource_type: "video",
+        folder: uploadFolder,
+        chunk_size: CLOUDINARY_CHUNK_SIZE,
+        timeout: CLOUDINARY_UPLOAD_TIMEOUT
+      },
+      (err, result) => {
+        if (err) {
+          log("cloudinary_upload_failed", {
+            error: err.message,
+            http_code: err.http_code,
+            name: err.name
+          });
+          return reject(err);
+        }
+        log("cloudinary_upload_done", { url: result.secure_url, bytes: result.bytes });
+        resolve(result);
+      }
+    );
+
+    const readStream = fs.createReadStream(outputPath);
+
+    // Without this, a read-side error (e.g. disk issue, file removed
+    // mid-upload) would leave the upload_large_stream callback never
+    // firing, and the whole job would hang until FFMPEG_TIMEOUT-unrelated
+    // infinity instead of failing cleanly.
+    readStream.on("error", (err) => {
+      log("cloudinary_upload_read_stream_error", { error: err.message });
+      reject(err);
+    });
+
+    stream.on("error", (err) => {
+      log("cloudinary_upload_stream_error", { error: err.message });
+      reject(err);
+    });
+
+    readStream.pipe(stream);
+  });
+};
+
 // ================= SHARED JOB PIPELINE =================
 // Both /merge and /compose do the same thing end to end -- queue, download,
 // normalize, [optional per-clip effects], run one ffmpeg composition step,
@@ -935,19 +1007,8 @@ const runClipJob = ({ requestId, clips, webhook, minClips, maxClips, sortClips, 
 
       updateJob(requestId, { step: "uploading" });
 
-      log("upload_start", { path: outputPath, size: fs.statSync(outputPath).size });
-
-      // ================= CLOUDINARY STREAM UPLOAD =================
-      const upload = await new Promise((resolve, reject) => {
-        const stream = cloudinary.uploader.upload_stream(
-          { resource_type: "video", folder: uploadFolder },
-          (err, result) => {
-            if (err) return reject(err);
-            resolve(result);
-          }
-        );
-        fs.createReadStream(outputPath).pipe(stream);
-      });
+      // ================= CLOUDINARY CHUNKED UPLOAD =================
+      const upload = await uploadToCloudinary(outputPath, uploadFolder);
 
       fs.rmSync(tempDir, { recursive: true, force: true });
 
@@ -956,6 +1017,7 @@ const runClipJob = ({ requestId, clips, webhook, minClips, maxClips, sortClips, 
         status: "done",
         url: upload.secure_url,
         duration: upload.duration,
+        bytes: upload.bytes,
         layout: usedLayout
       };
 
