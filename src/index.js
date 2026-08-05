@@ -222,24 +222,56 @@ const getDuration = (file) => {
   });
 };
 
+// Returns true if the file has at least one audio stream. Used by
+// normalizeClip to decide whether a silent track needs to be synthesized.
+const hasAudioStream = (file) => {
+  return new Promise((resolve) => {
+    const ffprobe = spawn("ffprobe", [
+      "-v", "error",
+      "-select_streams", "a",
+      "-show_entries", "stream=codec_type",
+      "-of", "default=noprint_wrappers=1:nokey=1",
+      file
+    ]);
+
+    let out = "";
+    ffprobe.stdout.on("data", d => { out += d.toString(); });
+    ffprobe.on("close", () => resolve(out.trim() === "audio"));
+    ffprobe.on("error", () => resolve(false));
+  });
+};
+
 // ================= NORMALIZE =================
 // Every clip -- whether it's headed into /merge or /compose -- gets forced
 // to the same resolution/fps/audio format first, so every composition
 // filter downstream (concat, overlay, vstack, zoompan) can assume matching
 // inputs instead of guarding against mismatches itself.
+//
+// ✅ FIX (audio drop): the previous version *always* added a second
+// `anullsrc` silent-audio input alongside the real clip, with `-shortest`
+// and no explicit `-map`. Without a `-map`, ffmpeg's default stream
+// picker selects one audio stream per output by its own internal
+// preference -- not necessarily the clip's real audio -- so clips that
+// already had a genuine audio track could have it silently swapped out
+// for the synthesized silence. Fix: probe the input first via ffprobe,
+// and only synthesize + mix in silent audio when the clip truly has no
+// audio stream of its own. Clips that already have audio now always keep it.
 const normalizeClip = async (input, output, jobId, webhook) => {
-  await runFFmpeg([
-    "-y",
-    "-i", input,
+  const hasAudio = await hasAudioStream(input);
 
-    // ✅ ADD SILENT AUDIO TRACK (CRITICAL FIX) -- guarantees every clip has
-    // an audio stream, even ones generated from a silent image-to-video job.
-    "-f", "lavfi",
-    "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+  const args = ["-y", "-i", input];
 
-    "-shortest",
+  if (!hasAudio) {
+    // Only add silent audio if the clip has NO audio track of its own
+    // (e.g. a clip generated from a silent image-to-video job).
+    args.push(
+      "-f", "lavfi",
+      "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+      "-shortest"
+    );
+  }
 
-    // ✅ SAFE SCALING (FIXES DIMENSION MISMATCH)
+  args.push(
     "-vf", `scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps=${OUTPUT_FPS}`,
 
     "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
@@ -252,7 +284,9 @@ const normalizeClip = async (input, output, jobId, webhook) => {
 
     "-movflags", "+faststart",
     output
-  ], jobId, webhook);
+  );
+
+  await runFFmpeg(args, jobId, webhook);
 };
 
 // ================= COMPOSITION LAYOUTS =================
