@@ -319,14 +319,32 @@ const hasAudioStream = (file) => {
 // ✅ Shared encode-arg builder so the thread cap + low-memory x264 params
 // live in exactly one place instead of being repeated (and easy to forget)
 // across every compose/effects function.
+//
+// ✅ PLAYBACK FIX: added "-pix_fmt yuv420p" to BOTH the CPU and GPU
+// branches. Without it, ffmpeg picks the pixel format closest to
+// whatever the *input* happens to be. If any source clip is 10-bit
+// or 4:2:2/4:4:4 chroma (common from AI video generators and some
+// screen recorders), libx264 will silently encode as High 4:4:4
+// Predictive or High 10 Profile instead of standard High/Main/Baseline.
+// Those profiles are NOT supported by Chrome/Safari's MP4 decoder --
+// the file is valid and plays fine in ffplay/VLC, but the browser
+// throws a generic "media playback aborted... corruption" error.
+// Forcing yuv420p here means every encode step in the pipeline
+// (normalize, per-clip effects, xfade transitions, filter_complex
+// composes, final effects) always outputs browser-safe 8-bit 4:2:0,
+// which also makes the concat-demuxer "-c copy" fast path safe --
+// every normalized clip is now guaranteed to share the same chroma
+// format going in, so stream-copying them together can't produce a
+// file with mismatched profiles baked into one container.
 const videoEncodeArgs = () => {
   if (USE_GPU) {
-    return ["-c:v", "h264_nvenc", "-preset", "p3"];
+    return ["-c:v", "h264_nvenc", "-preset", "p3", "-pix_fmt", "yuv420p"];
   }
   return [
     "-c:v", "libx264",
     "-preset", "veryfast",
     "-crf", "23",
+    "-pix_fmt", "yuv420p",
     "-x264-params", X264_LOW_MEM_PARAMS
   ];
 };
@@ -369,6 +387,11 @@ const normalizeClip = async (input, output, jobId, webhook) => {
 // simultaneously to feed the filter graph, so peak memory scaled with
 // clip count (50 clips = 50 open decoders). This fast path's memory
 // footprint is flat regardless of how many clips are in the job.
+//
+// Now that videoEncodeArgs() forces yuv420p on every input to this
+// function, this stream-copy is also playback-safe: there's no risk of
+// splicing together clips with different chroma subsampling/profile
+// baked in from normalization.
 const concatDemuxerCopy = async (normalized, outputPath, jobId, webhook) => {
   const listFile = `${outputPath}.concat.txt`;
   const listContent = normalized
