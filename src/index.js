@@ -25,7 +25,7 @@ const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "1", 10)
 // buffering and fewer open sockets/streams at once.
 const DOWNLOAD_CONCURRENCY = parseInt(process.env.DOWNLOAD_CONCURRENCY || "2", 10);
 
-const FFMPEG_TIMEOUT = parseInt(process.env.FFMPEG_TIMEOUT || "240000", 10);
+const FFMPEG_TIMEOUT = parseInt(process.env.FFMPEG_TIMEOUT || "120000", 10);
 
 const OUTPUT_WIDTH = 480;
 const OUTPUT_HEIGHT = 854;
