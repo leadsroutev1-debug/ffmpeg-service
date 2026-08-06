@@ -1169,6 +1169,20 @@ app.post("/compose", auth, (req, res) => {
 });
 
 // ================= START =================
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+// ✅ Hugging Face Spaces compatibility: HF Spaces builds Docker images and
+// always routes external traffic to container port 7860, regardless of
+// what PORT env var (if any) is set. It also identifies itself by
+// injecting a SPACE_ID env var into the container at runtime -- that's
+// not present on Railway/Render/Fly/plain Docker/etc, so this only
+// changes behavior when actually running inside a Space. Everywhere else
+// (existing deploys, other apps hitting this service), PORT/3000 default
+// stays exactly as before -- default deploy mode is unchanged.
+//
+// Binding to 0.0.0.0 (rather than the default which can resolve to
+// localhost/::1 depending on platform) is required on HF Spaces so the
+// proxy in front of the container can actually reach it; it's also a safe
+// no-op on every other host.
+const FINAL_PORT = process.env.SPACE_ID ? 7860 : PORT;
+app.listen(FINAL_PORT, "0.0.0.0", () => {
+  log(`🚀 API Service running safely on port ${FINAL_PORT}`);
 });
