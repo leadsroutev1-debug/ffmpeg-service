@@ -218,9 +218,19 @@ const runFFmpeg = (rawArgs, jobId, webhook) => {
   return new Promise((resolve, reject) => {
     const ffmpeg = spawn("ffmpeg", args);
 
+    // ✅ DIAGNOSTIC FIX: a SIGKILL from our own FFMPEG_TIMEOUT and a
+    // SIGKILL from the OS OOM killer look identical on close (code: null,
+    // signal: "SIGKILL") -- there was no way to tell them apart from the
+    // logs. `timedOut` disambiguates: if it's true, this was our timeout;
+    // if close still reports SIGKILL/null with timedOut false, that's a
+    // strong signal it was killed externally (most likely OOM).
+    let timedOut = false;
+    let lastProgress = null;
+
     const timeout = setTimeout(() => {
+      timedOut = true;
+      log("ffmpeg_timeout_killing", { jobId, timeoutMs: FFMPEG_TIMEOUT, lastProgress });
       ffmpeg.kill("SIGKILL");
-      reject(new Error("FFmpeg timeout"));
     }, FFMPEG_TIMEOUT);
 
     ffmpeg.stderr.on("data", async (d) => {
@@ -230,6 +240,7 @@ const runFFmpeg = (rawArgs, jobId, webhook) => {
       const timeMatch = output.match(/time=(\d+:\d+:\d+\.\d+)/);
       if (timeMatch) {
         const progress = timeMatch[1];
+        lastProgress = progress;
 
         updateJob(jobId, { progress });
 
@@ -241,11 +252,20 @@ const runFFmpeg = (rawArgs, jobId, webhook) => {
       }
     });
 
-    ffmpeg.on("close", code => {
+    ffmpeg.on("close", (code, signal) => {
       clearTimeout(timeout);
+
+      if (timedOut) {
+        log("ffmpeg_failed_timeout", { jobId, timeoutMs: FFMPEG_TIMEOUT, lastProgress });
+        return reject(new Error(`FFmpeg timeout after ${FFMPEG_TIMEOUT}ms (last progress: ${lastProgress || "none"})`));
+      }
+
       if (code !== 0) {
-        log("ffmpeg_failed", { code });
-        return reject(new Error(`FFmpeg exit ${code}`));
+        // code: null + signal: "SIGKILL"/"SIGTERM" here (with timedOut
+        // false) most likely means something outside this process killed
+        // it -- on Render that's almost always the OOM killer.
+        log("ffmpeg_failed", { code, signal, lastProgress, likelyOOM: code === null && !!signal });
+        return reject(new Error(`FFmpeg exit code=${code} signal=${signal || "none"}`));
       }
       resolve();
     });
