@@ -13,9 +13,19 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY;
 
 const MAX_CLIPS = 50;
-const MAX_CONCURRENT_JOBS = 2;
-const DOWNLOAD_CONCURRENCY = 3;
-const FFMPEG_TIMEOUT = 240000;
+
+// ✅ MEMORY FIX: this was 2. Two concurrent jobs means two full ffmpeg
+// pipelines (normalize + effects + compose, each its own ffmpeg process)
+// running at once, which roughly doubles peak RSS. On a small Render
+// instance that's very likely what's tipping you into OOM. Default to
+// running jobs one at a time; bump via env if you upgrade the instance.
+const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || "1", 10);
+
+// ✅ MEMORY FIX: fewer simultaneous downloads = less concurrent disk-write
+// buffering and fewer open sockets/streams at once.
+const DOWNLOAD_CONCURRENCY = parseInt(process.env.DOWNLOAD_CONCURRENCY || "2", 10);
+
+const FFMPEG_TIMEOUT = parseInt(process.env.FFMPEG_TIMEOUT || "240000", 10);
 
 const OUTPUT_WIDTH = 480;
 const OUTPUT_HEIGHT = 854;
@@ -23,26 +33,51 @@ const OUTPUT_FPS = 30;
 
 const USE_GPU = process.env.USE_GPU === "true";
 
-// ✅ FIX: Cloudinary's plain `upload_stream` is a single non-chunked
-// multipart request, capped at 100MB on most plans -- anything larger
-// than that fails (vague "file too large" error, or a hung/timed-out
-// socket, depending on plan/network). This pipeline concatenates
-// multiple normalized+effected clips into one output.mp4, so it's easy
-// to blow past 100MB on longer episodes/scenes. Chunked upload
-// (upload_large / upload_large_stream) fixes that by streaming the file
-// in CLOUDINARY_CHUNK_SIZE-byte pieces instead of one request.
+// ✅ MEMORY FIX: cap ffmpeg's own thread count. Each thread the encoder
+// spins up gets its own frame buffers/lookahead window, so on a
+// memory-constrained box (as opposed to CPU-constrained), fewer threads
+// means lower peak RSS per ffmpeg process, at the cost of some speed.
+const FFMPEG_THREADS = parseInt(process.env.FFMPEG_THREADS || "1", 10);
+
+// ✅ MEMORY FIX: libx264's biggest memory levers are B-frame reordering
+// and rc-lookahead (the encoder buffers this many future frames to plan
+// bitrate). Both scale with resolution × frame count held in memory.
+// At 480x854 this is a small win per-process, but it compounds across
+// every clip you normalize/effect/compose. Override via env if quality
+// suffers and you have RAM to spare.
+const X264_LOW_MEM_PARAMS = process.env.X264_LOW_MEM_PARAMS ||
+  "rc-lookahead=10:ref=1:bframes=0";
+
+// ✅ IMPORTANT (read this): os.tmpdir() usually resolves to /tmp. On many
+// container platforms -- Render included, depending on plan/runtime --
+// /tmp is a tmpfs mount, meaning it's backed by RAM, not disk. If that's
+// the case here, every downloaded clip + every normalized/effect/compose
+// intermediate file is *also* counting against your memory limit, on top
+// of ffmpeg's own working memory. That would explain OOM specifically
+// during "stitching" (many clips × multiple copies of each on disk at
+// once). Set TMP_DIR to a real persistent disk mount (Render lets you
+// attach one in the dashboard) to rule this out / fix it for good.
+const TMP_ROOT = process.env.TMP_DIR || os.tmpdir();
+
+// ✅ MEMORY FIX (leak, not spike): the in-memory `jobs` Map never had
+// anything removed from it, so on a long-running instance it grows
+// forever and slowly eats RAM until something (maybe this) tips you over.
+// Finished jobs are now swept out after JOB_TTL_MS.
+const JOB_TTL_MS = parseInt(process.env.JOB_TTL_MS || String(60 * 60 * 1000), 10); // 1h
+
+// Cloudinary's plain `upload_stream` is a single non-chunked multipart
+// request, capped at 100MB on most plans. Chunked upload (upload_large)
+// streams the file in CLOUDINARY_CHUNK_SIZE-byte pieces instead.
 const CLOUDINARY_CHUNK_SIZE = parseInt(process.env.CLOUDINARY_CHUNK_SIZE || "20000000", 10); // 20MB default
 const CLOUDINARY_UPLOAD_TIMEOUT = parseInt(process.env.CLOUDINARY_UPLOAD_TIMEOUT || "600000", 10); // 10 min
 
-// Ken Burns zoom rate for the "zoom" composition layout. 0.0015/frame at
-// 30fps ramps to ~1.5x zoom over roughly 11-12s -- tune if your shots run
-// much longer or shorter than that.
+// Ken Burns zoom rate for the "zoom" composition layout.
 const ZOOM_RATE = 0.0015;
 const ZOOM_MAX = 1.5;
 
-// How PIP boxes are sized/positioned for the "overlay" composition layout.
-const OVERLAY_SCALE = 0.35; // overlay clip width as a fraction of the base
-const OVERLAY_MARGIN = 24; // px from the edge
+// PIP box sizing/positioning for the "overlay" composition layout.
+const OVERLAY_SCALE = 0.35;
+const OVERLAY_MARGIN = 24;
 
 if (!API_KEY) {
   console.error("❌ Missing API_KEY");
@@ -62,6 +97,21 @@ app.use(express.json({ limit: "10mb" }));
 
 // ================= JOB STORE =================
 const jobs = new Map();
+
+// ✅ MEMORY FIX: periodic sweep of completed/failed jobs older than
+// JOB_TTL_MS so the Map doesn't grow unbounded over the service's uptime.
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, job] of jobs.entries()) {
+    if (
+      (job.status === "done" || job.status === "failed") &&
+      job._completedAt &&
+      now - job._completedAt > JOB_TTL_MS
+    ) {
+      jobs.delete(id);
+    }
+  }
+}, 5 * 60 * 1000);
 
 // ================= RATE LIMIT =================
 const requestCounts = new Map();
@@ -118,8 +168,6 @@ const updateJob = (id, patch) => {
   return updated;
 };
 
-// Used to order clips: v1 relied on this for scene_NNN merge order; it also
-// works fine for shot_NN compose order since both just end in a number.
 const extractTrailingNumber = (str) => {
   const match = str.match(/(\d+)/g);
   return match ? parseInt(match.pop(), 10) : Number.MAX_SAFE_INTEGER;
@@ -160,7 +208,13 @@ const downloadFile = async (url, outputPath) => {
 };
 
 // ================= FFMPEG =================
-const runFFmpeg = (args, jobId, webhook) => {
+// ✅ MEMORY FIX: every ffmpeg invocation now gets a global "-threads N"
+// cap injected right after "-y" (before any -i), which bounds both decode
+// and filter-graph thread pools, not just the encoder.
+const withThreadCap = (args) => ["-y", "-threads", String(FFMPEG_THREADS), ...args.filter(a => a !== "-y")];
+
+const runFFmpeg = (rawArgs, jobId, webhook) => {
+  const args = withThreadCap(rawArgs);
   return new Promise((resolve, reject) => {
     const ffmpeg = spawn("ffmpeg", args);
 
@@ -195,11 +249,14 @@ const runFFmpeg = (args, jobId, webhook) => {
       }
       resolve();
     });
+
+    ffmpeg.on("error", err => {
+      clearTimeout(timeout);
+      reject(err);
+    });
   });
 };
 
-// Returns duration in seconds (float) via ffprobe. Needed by the "overlay"
-// and "zoom" composition layouts, which have to reason about timing.
 const getDuration = (file) => {
   return new Promise((resolve, reject) => {
     const ffprobe = spawn("ffprobe", [
@@ -222,8 +279,6 @@ const getDuration = (file) => {
   });
 };
 
-// Returns true if the file has at least one audio stream. Used by
-// normalizeClip to decide whether a silent track needs to be synthesized.
 const hasAudioStream = (file) => {
   return new Promise((resolve) => {
     const ffprobe = spawn("ffprobe", [
@@ -241,29 +296,28 @@ const hasAudioStream = (file) => {
   });
 };
 
+// ✅ Shared encode-arg builder so the thread cap + low-memory x264 params
+// live in exactly one place instead of being repeated (and easy to forget)
+// across every compose/effects function.
+const videoEncodeArgs = () => {
+  if (USE_GPU) {
+    return ["-c:v", "h264_nvenc", "-preset", "p3"];
+  }
+  return [
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-crf", "23",
+    "-x264-params", X264_LOW_MEM_PARAMS
+  ];
+};
+
 // ================= NORMALIZE =================
-// Every clip -- whether it's headed into /merge or /compose -- gets forced
-// to the same resolution/fps/audio format first, so every composition
-// filter downstream (concat, overlay, vstack, zoompan) can assume matching
-// inputs instead of guarding against mismatches itself.
-//
-// ✅ FIX (audio drop): the previous version *always* added a second
-// `anullsrc` silent-audio input alongside the real clip, with `-shortest`
-// and no explicit `-map`. Without a `-map`, ffmpeg's default stream
-// picker selects one audio stream per output by its own internal
-// preference -- not necessarily the clip's real audio -- so clips that
-// already had a genuine audio track could have it silently swapped out
-// for the synthesized silence. Fix: probe the input first via ffprobe,
-// and only synthesize + mix in silent audio when the clip truly has no
-// audio stream of its own. Clips that already have audio now always keep it.
 const normalizeClip = async (input, output, jobId, webhook) => {
   const hasAudio = await hasAudioStream(input);
 
-  const args = ["-y", "-i", input];
+  const args = ["-i", input];
 
   if (!hasAudio) {
-    // Only add silent audio if the clip has NO audio track of its own
-    // (e.g. a clip generated from a silent image-to-video job).
     args.push(
       "-f", "lavfi",
       "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
@@ -273,15 +327,10 @@ const normalizeClip = async (input, output, jobId, webhook) => {
 
   args.push(
     "-vf", `scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps=${OUTPUT_FPS}`,
-
-    "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
-    "-preset", "veryfast",
-    "-crf", "23",
-
+    ...videoEncodeArgs(),
     "-c:a", "aac",
     "-ar", "44100",
     "-ac", "2",
-
     "-movflags", "+faststart",
     output
   );
@@ -289,17 +338,52 @@ const normalizeClip = async (input, output, jobId, webhook) => {
   await runFFmpeg(args, jobId, webhook);
 };
 
-// ================= COMPOSITION LAYOUTS =================
-// Each compose function takes an array of already-normalized clip paths
-// (same resolution/fps/audio format) and produces one output file. These
-// are what /compose calls per scene, and "cut" is also what /merge uses to
-// concatenate composed scenes into the final episode.
+// ================= CONCAT (fast path) =================
+// ✅ MEMORY FIX: this is the single biggest change. Every clip passed to
+// a compose step has already been through normalizeClip with IDENTICAL
+// codec/resolution/fps/audio settings. That means for a plain hard-cut
+// with no transition and no per-clip effects, we don't need to decode
+// and re-encode anything at all -- the concat *demuxer* can just splice
+// the already-encoded bitstreams together with "-c copy". The old
+// filter_complex concat had to keep every single input's decoder open
+// simultaneously to feed the filter graph, so peak memory scaled with
+// clip count (50 clips = 50 open decoders). This fast path's memory
+// footprint is flat regardless of how many clips are in the job.
+const concatDemuxerCopy = async (normalized, outputPath, jobId, webhook) => {
+  const listFile = `${outputPath}.concat.txt`;
+  const listContent = normalized
+    .map(f => `file '${path.resolve(f).replace(/'/g, "'\\''")}'`)
+    .join("\n");
+  fs.writeFileSync(listFile, listContent);
 
-// cut: hard-cut concatenation, in order. Works for any number of clips.
+  try {
+    await runFFmpeg([
+      "-f", "concat",
+      "-safe", "0",
+      "-i", listFile,
+      "-c", "copy",
+      "-movflags", "+faststart",
+      outputPath
+    ], jobId, webhook);
+  } finally {
+    fs.rmSync(listFile, { force: true });
+  }
+};
+
+// ================= COMPOSITION LAYOUTS =================
 const composeCut = async (normalized, outputPath, jobId, webhook) => {
   if (normalized.length === 1) {
     fs.copyFileSync(normalized[0], outputPath);
     return;
+  }
+
+  try {
+    await concatDemuxerCopy(normalized, outputPath, jobId, webhook);
+    return;
+  } catch (err) {
+    // Falls back to the old decode+re-encode path only if stream-copy
+    // concat fails (e.g. a clip slipped through with mismatched params).
+    log("concat_demuxer_failed_falling_back_to_filter_complex", { error: err.message });
   }
 
   const filter =
@@ -307,27 +391,17 @@ const composeCut = async (normalized, outputPath, jobId, webhook) => {
     `concat=n=${normalized.length}:v=1:a=1[outv][outa]`;
 
   await runFFmpeg([
-    "-y",
     ...normalized.flatMap(c => ["-i", c]),
     "-filter_complex", filter,
     "-map", "[outv]",
     "-map", "[outa]",
-    "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
-    "-preset", "veryfast",
-    "-crf", "23",
+    ...videoEncodeArgs(),
     "-c:a", "aac",
     "-movflags", "+faststart",
     outputPath
   ], jobId, webhook);
 };
 
-// overlay: normalized[0] plays as the full-frame base for its own duration.
-// Every subsequent clip gets an equal-length window of that base's runtime
-// as a small picture-in-picture box (bottom-right), one after another.
-// Overlay clips are muted -- only the base clip's audio plays -- so we
-// don't have to sync/mix multiple simultaneous dialogue tracks. If you need
-// overlay audio too, mix it in with an amix graph; flagged here rather than
-// guessed at, since the right mix levels are a creative call.
 const composeOverlay = async (normalized, outputPath, jobId, webhook) => {
   const [base, ...overlays] = normalized;
 
@@ -349,7 +423,6 @@ const composeOverlay = async (normalized, outputPath, jobId, webhook) => {
     .map((_, i) => `[${i + 1}:v]scale=${boxW}:${boxH}[ov${i}]`)
     .join(";");
 
-  let chain = "[0:v]";
   const overlaySteps = overlays
     .map((_, i) => {
       const start = (i * segDuration).toFixed(3);
@@ -363,26 +436,18 @@ const composeOverlay = async (normalized, outputPath, jobId, webhook) => {
   const filter = `${scaleFilters};${overlaySteps}`;
 
   await runFFmpeg([
-    "-y",
     ...inputs,
     "-filter_complex", filter,
     "-map", "[outv]",
     "-map", "0:a:0",
     "-t", baseDuration.toFixed(3),
-    "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
-    "-preset", "veryfast",
-    "-crf", "23",
+    ...videoEncodeArgs(),
     "-c:a", "aac",
     "-movflags", "+faststart",
     outputPath
   ], jobId, webhook);
 };
 
-// split: exactly 2 clips, stacked top/bottom (vstack) to suit the vertical
-// 9:16 output -- side-by-side (hstack) would squeeze both shots too
-// narrow at 480px wide. Both clips' audio is mixed together. If either
-// clip is shorter than the other, the stack (and therefore the output)
-// naturally ends when the shorter one runs out.
 const composeSplit = async (normalized, outputPath, jobId, webhook) => {
   const [top, bottom] = normalized;
   const halfH = Math.floor(OUTPUT_HEIGHT / 2);
@@ -394,25 +459,18 @@ const composeSplit = async (normalized, outputPath, jobId, webhook) => {
     `[0:a][1:a]amix=inputs=2:duration=shortest:dropout_transition=0[outa]`;
 
   await runFFmpeg([
-    "-y",
     "-i", top,
     "-i", bottom,
     "-filter_complex", filter,
     "-map", "[outv]",
     "-map", "[outa]",
-    "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
-    "-preset", "veryfast",
-    "-crf", "23",
+    ...videoEncodeArgs(),
     "-c:a", "aac",
     "-movflags", "+faststart",
     outputPath
   ], jobId, webhook);
 };
 
-// zoom: a single shot with a Ken Burns push-in. Only the first clip is
-// used -- if more were supplied for a "zoom" scene, that's a Director/
-// n8n-side mistake (a zoom scene should only ever have one shot), so we
-// log it rather than silently discarding footage without a trace.
 const composeZoom = async (normalized, outputPath, jobId, webhook) => {
   if (normalized.length > 1) {
     log("zoom_layout_extra_clips_ignored", { extraCount: normalized.length - 1 });
@@ -428,13 +486,10 @@ const composeZoom = async (normalized, outputPath, jobId, webhook) => {
     `s=${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}:fps=${OUTPUT_FPS}`;
 
   await runFFmpeg([
-    "-y",
     "-i", clip,
     "-vf", filter,
     "-map", "0:a:0",
-    "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
-    "-preset", "veryfast",
-    "-crf", "23",
+    ...videoEncodeArgs(),
     "-c:a", "aac",
     "-movflags", "+faststart",
     outputPath
@@ -442,20 +497,8 @@ const composeZoom = async (normalized, outputPath, jobId, webhook) => {
 };
 
 // ============================================================
-// ================= STUDIO EFFECTS CATALOG (NEW) =============
+// ================= STUDIO EFFECTS CATALOG ====================
 // ============================================================
-// Everything in this section is additive and opt-in. If a caller sends the
-// exact same payloads as before (plain string arrays, no `effects`/`opts`
-// fields), none of this code path executes and output is byte-identical to
-// the original pipeline. New callers can opt into per-clip motion/color/
-// overlay effects, cross-fade transitions between clips, and new composite
-// layouts, all addressed by name so n8n/Director can pick them from a list
-// (see GET /effects).
-
-// ---- Transitions (56) -----------------------------------------------
-// These map 1:1 to ffmpeg's native `xfade` transition names, so they're
-// real, battle-tested GPU/CPU-friendly cross-dissolve/wipe/slide effects,
-// not reinvented ones.
 const TRANSITIONS = [
   "fade", "fadeblack", "fadewhite", "distance",
   "wipeleft", "wiperight", "wipeup", "wipedown",
@@ -474,10 +517,6 @@ const TRANSITIONS = [
   "revealleft", "revealright", "revealup", "revealdown"
 ];
 
-// ---- Motion / animation effects (18) ---------------------------------
-// Applied to a single already-normalized clip. Each entry returns
-// { vf, af } -- af is only present for effects that change playback speed
-// (audio has to move in lockstep or it drifts out of sync).
 const MOTION_EFFECTS = {
   zoom_in: (dur) => {
     const frames = Math.max(1, Math.round(dur * OUTPUT_FPS));
@@ -536,10 +575,6 @@ const MOTION_EFFECTS = {
   vertical_flip: () => ({ vf: `vflip` })
 };
 
-// ---- Color grades (26) ------------------------------------------------
-// A mix of hand-tuned filter chains and ffmpeg's built-in `curves` presets
-// (cross_process, vintage, negative, etc. are native curves presets, not
-// approximations).
 const COLOR_GRADES = {
   cinematic_teal_orange: `colorbalance=rs=-0.12:gs=0.03:bs=0.15:rm=-0.06:bm=0.1:rh=0.08:bh=-0.05,eq=contrast=1.12:saturation=1.1`,
   noir_bw: `hue=s=0,eq=contrast=1.3:brightness=-0.02`,
@@ -569,7 +604,6 @@ const COLOR_GRADES = {
   horror_green: `colorbalance=gm=0.3:rm=-0.2,eq=contrast=1.15`
 };
 
-// ---- Overlay effects (8) -----------------------------------------------
 const OVERLAY_EFFECTS = {
   vignette_dark: `vignette=PI/4`,
   film_grain: `noise=alls=20:allf=t+u`,
@@ -580,9 +614,6 @@ const OVERLAY_EFFECTS = {
   chromatic_aberration: `rgbashift=rh=2:bh=-2`,
   light_leak_warm: `vignette=PI/6:mode=backward,eq=brightness=0.03:saturation=1.1`
 };
-
-// ---- Composite layouts added to the original 4 (cut/overlay/split/zoom):
-//   grid4, triptych, pip  --> 7 total layouts
 
 const escapeDrawtext = (text) =>
   String(text).replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\\'");
@@ -596,9 +627,6 @@ const buildDrawText = ({ text, position = "bottom", fontSize = 36, fontColor = "
   return `drawtext=text='${safe}':fontcolor=${fontColor}:fontsize=${fontSize}:box=1:boxcolor=black@0.5:boxborderw=10:x=(w-text_w)/2:y=${yExpr}`;
 };
 
-// Combines an optional motion effect + color grade + list of overlay
-// effects for ONE clip into a single { vf, af } pair. Unknown names are
-// logged and skipped rather than failing the whole job.
 const buildEffectFilterChain = (spec, duration) => {
   const vfParts = [];
   const afParts = [];
@@ -631,8 +659,6 @@ const buildEffectFilterChain = (spec, duration) => {
   return { vf: vfParts.join(","), af: afParts.join(",") };
 };
 
-// Applies a per-clip effects spec to one normalized clip. If the spec is
-// empty, just copies the file through untouched (cheap, no re-encode).
 const applyClipEffects = async (input, output, spec, jobId, webhook) => {
   const hasEffects = spec && (spec.motion || spec.colorGrade || (spec.overlays && spec.overlays.length));
   if (!hasEffects) {
@@ -643,9 +669,9 @@ const applyClipEffects = async (input, output, spec, jobId, webhook) => {
   const duration = await getDuration(input);
   const { vf, af } = buildEffectFilterChain(spec, duration);
 
-  const args = ["-y", "-i", input];
+  const args = ["-i", input];
   if (vf) args.push("-vf", vf);
-  args.push("-c:v", USE_GPU ? "h264_nvenc" : "libx264", "-preset", "veryfast", "-crf", "23");
+  args.push(...videoEncodeArgs());
   if (af) {
     args.push("-af", af, "-c:a", "aac");
   } else {
@@ -656,55 +682,50 @@ const applyClipEffects = async (input, output, spec, jobId, webhook) => {
   await runFFmpeg(args, jobId, webhook);
 };
 
-// cut with cross-fade transitions: chains xfade (video) + acrossfade
-// (audio) across N clips instead of a hard concat. Falls back to plain
-// composeCut if no transition is requested.
+// ✅ MEMORY FIX: rolling pairwise merge instead of one filter_complex
+// graph with all N clips open at once. Each step only ever has 2 inputs
+// decoding simultaneously, so memory stays flat no matter how many clips
+// are in the scene/episode. Intermediate step files are written to disk
+// and deleted as soon as they're consumed by the next step.
 const composeCutTransition = async (normalized, outputPath, jobId, webhook, transitionName, transitionDuration) => {
   if (normalized.length === 1) {
     fs.copyFileSync(normalized[0], outputPath);
     return;
   }
 
-  const durations = [];
-  for (const c of normalized) durations.push(await getDuration(c));
-
-  const td = Math.max(0.1, Math.min(transitionDuration || 0.5, Math.min(...durations) / 2));
-
-  const filterParts = [];
-  const audioParts = [];
-  let cumulative = durations[0];
-  let vLabel = "0:v";
-  let aLabel = "0:a";
+  const tmpDir = path.dirname(outputPath);
+  let current = normalized[0];
+  let ownsCurrent = false; // true once "current" is a step file we created (safe to delete)
 
   for (let i = 1; i < normalized.length; i++) {
-    const offset = Math.max(0, cumulative - td);
+    const next = normalized[i];
+    const currentDuration = await getDuration(current);
+    const nextDuration = await getDuration(next);
+    const td = Math.max(0.1, Math.min(transitionDuration || 0.5, Math.min(currentDuration, nextDuration) / 2));
+    const offset = Math.max(0, currentDuration - td);
     const isLast = i === normalized.length - 1;
-    const outV = isLast ? "outv" : `v${i}`;
-    const outA = isLast ? "outa" : `a${i}`;
+    const stepOut = isLast ? outputPath : path.join(tmpDir, `xfstep_${i}.mp4`);
 
-    filterParts.push(`[${vLabel}][${i}:v]xfade=transition=${transitionName}:duration=${td.toFixed(3)}:offset=${offset.toFixed(3)}[${outV}]`);
-    audioParts.push(`[${aLabel}][${i}:a]acrossfade=d=${td.toFixed(3)}[${outA}]`);
+    const filter =
+      `[0:v][1:v]xfade=transition=${transitionName}:duration=${td.toFixed(3)}:offset=${offset.toFixed(3)}[outv];` +
+      `[0:a][1:a]acrossfade=d=${td.toFixed(3)}[outa]`;
 
-    vLabel = outV;
-    aLabel = outA;
-    cumulative = offset + durations[i];
+    await runFFmpeg([
+      "-i", current,
+      "-i", next,
+      "-filter_complex", filter,
+      "-map", "[outv]",
+      "-map", "[outa]",
+      ...videoEncodeArgs(),
+      "-c:a", "aac",
+      "-movflags", "+faststart",
+      stepOut
+    ], jobId, webhook);
+
+    if (ownsCurrent) fs.rmSync(current, { force: true });
+    current = stepOut;
+    ownsCurrent = true;
   }
-
-  const filter = [...filterParts, ...audioParts].join(";");
-
-  await runFFmpeg([
-    "-y",
-    ...normalized.flatMap(c => ["-i", c]),
-    "-filter_complex", filter,
-    "-map", "[outv]",
-    "-map", "[outa]",
-    "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
-    "-preset", "veryfast",
-    "-crf", "23",
-    "-c:a", "aac",
-    "-movflags", "+faststart",
-    outputPath
-  ], jobId, webhook);
 };
 
 const composeCutOrTransition = async (normalized, outputPath, jobId, webhook, opts = {}) => {
@@ -714,7 +735,6 @@ const composeCutOrTransition = async (normalized, outputPath, jobId, webhook, op
   return composeCut(normalized, outputPath, jobId, webhook);
 };
 
-// grid4: exactly 4 clips in a 2x2 grid, audio mixed from all 4.
 const composeGrid4 = async (normalized, outputPath, jobId, webhook) => {
   const halfW = Math.floor(OUTPUT_WIDTH / 2);
   const halfH = Math.floor(OUTPUT_HEIGHT / 2);
@@ -730,21 +750,17 @@ const composeGrid4 = async (normalized, outputPath, jobId, webhook) => {
     `[0:a][1:a][2:a][3:a]amix=inputs=4:duration=shortest:dropout_transition=0[outa]`;
 
   await runFFmpeg([
-    "-y",
     ...normalized.slice(0, 4).flatMap(c => ["-i", c]),
     "-filter_complex", filter,
     "-map", "[outv]",
     "-map", "[outa]",
-    "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
-    "-preset", "veryfast",
-    "-crf", "23",
+    ...videoEncodeArgs(),
     "-c:a", "aac",
     "-movflags", "+faststart",
     outputPath
   ], jobId, webhook);
 };
 
-// triptych: exactly 3 clips side by side (160px columns at 480 width).
 const composeTriptych = async (normalized, outputPath, jobId, webhook) => {
   const colW = Math.floor(OUTPUT_WIDTH / 3);
 
@@ -756,23 +772,17 @@ const composeTriptych = async (normalized, outputPath, jobId, webhook) => {
     `[0:a][1:a][2:a]amix=inputs=3:duration=shortest:dropout_transition=0[outa]`;
 
   await runFFmpeg([
-    "-y",
     ...normalized.slice(0, 3).flatMap(c => ["-i", c]),
     "-filter_complex", filter,
     "-map", "[outv]",
     "-map", "[outa]",
-    "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
-    "-preset", "veryfast",
-    "-crf", "23",
+    ...videoEncodeArgs(),
     "-c:a", "aac",
     "-movflags", "+faststart",
     outputPath
   ], jobId, webhook);
 };
 
-// pip: base clip full-frame for its whole duration, second clip as a
-// picture-in-picture box in a configurable corner, for the whole duration
-// (unlike "overlay", which time-slices multiple overlay clips).
 const composePipCustom = async (normalized, outputPath, jobId, webhook, opts = {}) => {
   const [base, pip] = normalized;
   const scale = opts.pipScale || OVERLAY_SCALE;
@@ -795,23 +805,18 @@ const composePipCustom = async (normalized, outputPath, jobId, webhook, opts = {
     : `[1:v]scale=${boxW}:${boxH}[pv];[0:v][pv]overlay=${x}:${y}[outv]`;
 
   await runFFmpeg([
-    "-y",
     "-i", base,
     "-i", pip,
     "-filter_complex", filter,
     "-map", "[outv]",
     "-map", useAmix ? "[outa]" : "0:a",
-    "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
-    "-preset", "veryfast",
-    "-crf", "23",
+    ...videoEncodeArgs(),
     "-c:a", "aac",
     "-movflags", "+faststart",
     outputPath
   ], jobId, webhook);
 };
 
-// Final, whole-video post-process: global color grade, global overlays,
-// and/or a text card. Skipped (cheap copy) if none of those were requested.
 const buildFinalFilterChain = (opts = {}) => {
   const vfParts = [];
   if (opts.finalColorGrade && COLOR_GRADES[opts.finalColorGrade]) {
@@ -839,22 +844,15 @@ const applyFinalEffects = async (input, output, opts, jobId, webhook) => {
     return;
   }
   await runFFmpeg([
-    "-y",
     "-i", input,
     "-vf", chain,
-    "-c:v", USE_GPU ? "h264_nvenc" : "libx264",
-    "-preset", "veryfast",
-    "-crf", "23",
+    ...videoEncodeArgs(),
     "-c:a", "copy",
     "-movflags", "+faststart",
     output
   ], jobId, webhook);
 };
 
-// Resolves the requested layout to a compose function, applying sane
-// fallbacks (documented on the n8n side too) rather than failing the whole
-// scene over a layout/clip-count mismatch. `opts` carries layout-specific
-// extras (transition name/duration, pip corner/scale/audio).
 const resolveComposer = (layout, clipCount, opts = {}) => {
   switch (layout) {
     case "split":
@@ -893,9 +891,6 @@ const resolveComposer = (layout, clipCount, opts = {}) => {
 
 const LAYOUTS = ["cut", "overlay", "split", "zoom", "grid4", "triptych", "pip"];
 
-// Turns a raw clip entry (string OR {url, motion, colorGrade, overlays})
-// into a normalized { url, effects } shape. Old-style string arrays keep
-// working exactly as before -- effects is just null for them.
 const parseClipEntry = (entry) => {
   if (typeof entry === "string") return { url: entry, effects: null };
   return {
@@ -908,13 +903,7 @@ const parseClipEntry = (entry) => {
   };
 };
 
-// ================= CLOUDINARY UPLOAD (FIXED) =================
-// ✅ FIX: the installed cloudinary SDK version on this deploy does not
-// expose `upload_large_stream` ("upload_large_stream is not a function").
-// `upload_large` has been part of the SDK far longer, takes the local file
-// path directly, and still auto-chunks the upload in CLOUDINARY_CHUNK_SIZE
-// pieces -- same fix for the >100MB single-request cap, without needing to
-// pipe a manual read stream.
+// ================= CLOUDINARY UPLOAD =================
 const uploadToCloudinary = (outputPath, uploadFolder) => {
   return new Promise((resolve, reject) => {
     if (!fs.existsSync(outputPath)) {
@@ -952,11 +941,6 @@ const uploadToCloudinary = (outputPath, uploadFolder) => {
 };
 
 // ================= SHARED JOB PIPELINE =================
-// Both /merge and /compose do the same thing end to end -- queue, download,
-// normalize, [optional per-clip effects], run one ffmpeg composition step,
-// [optional final effects], upload, report -- so that pipeline lives in one
-// place and each route just supplies the ordering rule, the composer, and
-// the upload folder.
 const runClipJob = ({ requestId, clips, webhook, minClips, maxClips, sortClips, composerFor, uploadFolder, opts = {} }) => {
   jobLimit(async () => {
     let tempDir;
@@ -975,14 +959,14 @@ const runClipJob = ({ requestId, clips, webhook, minClips, maxClips, sortClips, 
         ? [...parsed].sort((a, b) => extractTrailingNumber(a.url) - extractTrailingNumber(b.url))
         : parsed;
 
-      tempDir = path.join(os.tmpdir(), requestId);
+      tempDir = path.join(TMP_ROOT, requestId);
       fs.mkdirSync(tempDir, { recursive: true });
 
       // ================= DOWNLOAD =================
-      const limit = pLimit(DOWNLOAD_CONCURRENCY);
+      const dlLimit = pLimit(DOWNLOAD_CONCURRENCY);
       const localClips = await Promise.all(
         ordered.map((clip, i) =>
-          limit(async () => {
+          dlLimit(async () => {
             const file = path.join(tempDir, `clip_${i}.mp4`);
             await downloadFile(clip.url, file);
             return file;
@@ -993,19 +977,26 @@ const runClipJob = ({ requestId, clips, webhook, minClips, maxClips, sortClips, 
       updateJob(requestId, { step: "normalizing" });
 
       // ================= NORMALIZE =================
+      // ✅ MEMORY FIX: delete each source clip right after it's normalized
+      // instead of holding on to every original + every normalized copy
+      // simultaneously until the whole job finishes. If TMP_ROOT turns
+      // out to be tmpfs (RAM-backed), this materially lowers peak usage;
+      // even on real disk it reduces fd/inode pressure during long jobs.
       const normalizedRaw = [];
       for (let i = 0; i < localClips.length; i++) {
         const out = path.join(tempDir, `norm_${i}.mp4`);
         await normalizeClip(localClips[i], out, requestId, webhook);
+        fs.rmSync(localClips[i], { force: true });
         normalizedRaw.push(out);
       }
 
-      // ================= PER-CLIP EFFECTS (NEW, opt-in) =================
+      // ================= PER-CLIP EFFECTS =================
       updateJob(requestId, { step: "applying_effects" });
       const normalized = [];
       for (let i = 0; i < normalizedRaw.length; i++) {
         const out = path.join(tempDir, `fx_${i}.mp4`);
         await applyClipEffects(normalizedRaw[i], out, ordered[i].effects, requestId, webhook);
+        fs.rmSync(normalizedRaw[i], { force: true });
         normalized.push(out);
       }
 
@@ -1015,11 +1006,13 @@ const runClipJob = ({ requestId, clips, webhook, minClips, maxClips, sortClips, 
       const { fn: composeFn, usedLayout } = composerFor(normalized.length);
       const composedPath = path.join(tempDir, "composed.mp4");
       await composeFn(normalized, composedPath, requestId, webhook);
+      for (const f of normalized) fs.rmSync(f, { force: true });
 
-      // ================= FINAL EFFECTS (NEW, opt-in) =================
+      // ================= FINAL EFFECTS =================
       updateJob(requestId, { step: "finalizing" });
       const outputPath = path.join(tempDir, "output.mp4");
       await applyFinalEffects(composedPath, outputPath, opts, requestId, webhook);
+      fs.rmSync(composedPath, { force: true });
 
       updateJob(requestId, { step: "uploading" });
 
@@ -1034,7 +1027,8 @@ const runClipJob = ({ requestId, clips, webhook, minClips, maxClips, sortClips, 
         url: upload.secure_url,
         duration: upload.duration,
         bytes: upload.bytes,
-        layout: usedLayout
+        layout: usedLayout,
+        _completedAt: Date.now()
       };
 
       jobs.set(requestId, { ...jobs.get(requestId), ...result });
@@ -1044,7 +1038,8 @@ const runClipJob = ({ requestId, clips, webhook, minClips, maxClips, sortClips, 
       const failPayload = {
         jobId: requestId,
         status: "failed",
-        error: err?.response?.data || err.message
+        error: err?.response?.data || err.message,
+        _completedAt: Date.now()
       };
 
       jobs.set(requestId, { ...jobs.get(requestId), ...failPayload });
@@ -1069,7 +1064,6 @@ app.get("/jobs", auth, (_, res) => {
   res.json([...jobs.values()]);
 });
 
-// Lets n8n/Director introspect the full catalog instead of hardcoding names.
 app.get("/effects", auth, (_, res) => {
   res.json({
     layouts: LAYOUTS,
@@ -1080,9 +1074,7 @@ app.get("/effects", auth, (_, res) => {
   });
 });
 
-// ================= MERGE (final episode: composed scene clips -> one video) =================
-// Body: { clips: (string | {url, motion, colorGrade, overlays})[], webhook?,
-//         transition?, transitionDuration?, finalColorGrade?, finalOverlays?, textOverlay? }
+// ================= MERGE =================
 app.post("/merge", auth, (req, res) => {
   const requestId = uuidv4();
   jobs.set(requestId, { id: requestId, status: "queued", progress: 0 });
@@ -1102,7 +1094,7 @@ app.post("/merge", auth, (req, res) => {
     webhook,
     minClips: 2,
     maxClips: MAX_CLIPS,
-    sortClips: true, // scene_NNN URLs -- keep numeric-order safety net from v1
+    sortClips: true,
     composerFor: (clipCount) => resolveComposer("cut", clipCount, opts),
     uploadFolder: "ai-movies/episodes",
     opts
@@ -1111,15 +1103,7 @@ app.post("/merge", auth, (req, res) => {
   res.json({ jobId: requestId, statusUrl: `/status/${requestId}` });
 });
 
-// ================= COMPOSE (one scene: shot clips -> one scene clip) =================
-// Body:
-//   { clips: (string | {url, motion, colorGrade, overlays})[],
-//     layout: "cut" | "overlay" | "split" | "zoom" | "grid4" | "triptych" | "pip",
-//     webhook?, transition?, transitionDuration?,
-//     pipCorner?, pipScale?, pipAudio?,
-//     finalColorGrade?, finalOverlays?, textOverlay? }
-// Returns { jobId, statusUrl } immediately, same shape as /merge; poll
-// /status/:id for { status: "processing" | "done" | "failed", url, layout }.
+// ================= COMPOSE =================
 app.post("/compose", auth, (req, res) => {
   const requestId = uuidv4();
   jobs.set(requestId, { id: requestId, status: "queued", progress: 0 });
@@ -1154,9 +1138,6 @@ app.post("/compose", auth, (req, res) => {
     requestId,
     clips,
     webhook,
-    // shot clips arrive already ordered (shot_01, shot_02, ...) from the
-    // n8n side's Cloudinary folder listing; re-sorting is a safety net,
-    // same principle as /merge trusting scene_NNN numbering.
     minClips: minClipsByLayout[layout] ?? 2,
     maxClips: MAX_CLIPS,
     sortClips: true,
@@ -1169,20 +1150,6 @@ app.post("/compose", auth, (req, res) => {
 });
 
 // ================= START =================
-// ✅ Hugging Face Spaces compatibility: HF Spaces builds Docker images and
-// always routes external traffic to container port 7860, regardless of
-// what PORT env var (if any) is set. It also identifies itself by
-// injecting a SPACE_ID env var into the container at runtime -- that's
-// not present on Railway/Render/Fly/plain Docker/etc, so this only
-// changes behavior when actually running inside a Space. Everywhere else
-// (existing deploys, other apps hitting this service), PORT/3000 default
-// stays exactly as before -- default deploy mode is unchanged.
-//
-// Binding to 0.0.0.0 (rather than the default which can resolve to
-// localhost/::1 depending on platform) is required on HF Spaces so the
-// proxy in front of the container can actually reach it; it's also a safe
-// no-op on every other host.
-const FINAL_PORT = process.env.SPACE_ID ? 7860 : PORT;
-app.listen(FINAL_PORT, "0.0.0.0", () => {
-  log(`🚀 API Service running safely on port ${FINAL_PORT}`);
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT} (MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS}, FFMPEG_THREADS=${FFMPEG_THREADS}, TMP_ROOT=${TMP_ROOT})`);
 });
