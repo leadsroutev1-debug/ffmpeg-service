@@ -27,9 +27,28 @@ const DOWNLOAD_CONCURRENCY = parseInt(process.env.DOWNLOAD_CONCURRENCY || "2", 1
 
 const FFMPEG_TIMEOUT = parseInt(process.env.FFMPEG_TIMEOUT || "1200000", 10);
 
-const OUTPUT_WIDTH = 480;
-const OUTPUT_HEIGHT = 854;
-const OUTPUT_FPS = 30;
+// ================= QUALITY / DELIVERY =================
+// Keep the native LTX vertical master size by default.
+// LTX portrait shots in the studio are generated at 1024x1536.
+// The old service hard-downscaled them to 480x854 before composition,
+// permanently throwing away detail. Override only when you intentionally
+// want a smaller delivery master.
+const OUTPUT_WIDTH = parseInt(process.env.OUTPUT_WIDTH || "1024", 10);
+const OUTPUT_HEIGHT = parseInt(process.env.OUTPUT_HEIGHT || "1536", 10);
+const OUTPUT_FPS = parseInt(process.env.OUTPUT_FPS || "30", 10);
+
+// Quality-first H.264 defaults. CRF 18 is visually much closer to a
+// transparent master than CRF 23 while remaining practical on CPU.
+// "fast" is a reasonable Render trade-off; set VIDEO_PRESET=medium when
+// you have CPU headroom and want more compression efficiency.
+const VIDEO_CRF = parseInt(process.env.VIDEO_CRF || "18", 10);
+const VIDEO_PRESET = process.env.VIDEO_PRESET || "fast";
+
+// Preserve encoder look-ahead/reference frames enough to avoid the very
+// aggressive low-memory settings used by the old service. FFMPEG_THREADS
+// still limits total process threading for small Render instances.
+const X264_QUALITY_PARAMS = process.env.X264_QUALITY_PARAMS ||
+  "rc-lookahead=12:ref=3:bframes=2";
 
 const USE_GPU = process.env.USE_GPU === "true";
 
@@ -38,15 +57,6 @@ const USE_GPU = process.env.USE_GPU === "true";
 // memory-constrained box (as opposed to CPU-constrained), fewer threads
 // means lower peak RSS per ffmpeg process, at the cost of some speed.
 const FFMPEG_THREADS = parseInt(process.env.FFMPEG_THREADS || "1", 10);
-
-// ✅ MEMORY FIX: libx264's biggest memory levers are B-frame reordering
-// and rc-lookahead (the encoder buffers this many future frames to plan
-// bitrate). Both scale with resolution × frame count held in memory.
-// At 480x854 this is a small win per-process, but it compounds across
-// every clip you normalize/effect/compose. Override via env if quality
-// suffers and you have RAM to spare.
-const X264_LOW_MEM_PARAMS = process.env.X264_LOW_MEM_PARAMS ||
-  "rc-lookahead=10:ref=1:bframes=0";
 
 // ✅ IMPORTANT (read this): os.tmpdir() usually resolves to /tmp. On many
 // container platforms -- Render included, depending on plan/runtime --
@@ -338,14 +348,19 @@ const hasAudioStream = (file) => {
 // file with mismatched profiles baked into one container.
 const videoEncodeArgs = () => {
   if (USE_GPU) {
-    return ["-c:v", "h264_nvenc", "-preset", "p3", "-pix_fmt", "yuv420p"];
+    return [
+      "-c:v", "h264_nvenc",
+      "-preset", process.env.NVENC_PRESET || "p4",
+      "-cq", String(process.env.NVENC_CQ || "19"),
+      "-pix_fmt", "yuv420p"
+    ];
   }
   return [
     "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", "23",
+    "-preset", VIDEO_PRESET,
+    "-crf", String(VIDEO_CRF),
     "-pix_fmt", "yuv420p",
-    "-x264-params", X264_LOW_MEM_PARAMS
+    "-x264-params", X264_QUALITY_PARAMS
   ];
 };
 
@@ -364,7 +379,7 @@ const normalizeClip = async (input, output, jobId, webhook) => {
   }
 
   args.push(
-    "-vf", `scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps=${OUTPUT_FPS}`,
+    "-vf", `scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,fps=${OUTPUT_FPS}`,
     ...videoEncodeArgs(),
     "-c:a", "aac",
     "-ar", "44100",
@@ -1194,5 +1209,11 @@ app.post("/compose", auth, (req, res) => {
 
 // ================= START =================
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT} (MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS}, FFMPEG_THREADS=${FFMPEG_THREADS}, TMP_ROOT=${TMP_ROOT})`);
+  console.log(
+    `🚀 Server running on port ${PORT} ` +
+    `(MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS}, ` +
+    `FFMPEG_THREADS=${FFMPEG_THREADS}, TMP_ROOT=${TMP_ROOT}, ` +
+    `OUTPUT=${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}@${OUTPUT_FPS}, ` +
+    `VIDEO_CRF=${VIDEO_CRF}, VIDEO_PRESET=${VIDEO_PRESET})`
+  );
 });
